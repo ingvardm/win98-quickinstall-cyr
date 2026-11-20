@@ -175,6 +175,29 @@ def creg_data_offset(off, name):
     return off + 4 + len(name)
 
 
+# Tail of the Nls\Locale value list: the named value "0000041E" with empty data,
+# followed by an 8-byte trailer and then the Locale key's DEFAULT value record.
+# This anchor is present in v1.0.0 and v1.1.0 alike; key ORDER is not stable
+# (v1.1.0 and v1.0.0 Stock put Locale before Codepage; v1.0.0 98Lite Sleek
+# puts it after), so "record before ACP" alone is not a valid general rule.
+LOCALE_ANCHOR = b'\x08\x00\x00\x00' + b'0000041E'
+
+
+def select_locale_default(data, name, value, acp_off):
+    """Choose the active Nls\\Locale default-value record (name_len=0). Prefer
+    an anchored record preceding the unique ACP record; otherwise take the
+    first anchored record; as a last resort take the first matching record.
+    Returns an offset or None."""
+    all_offs = creg_find(data, name, value)
+    anchored = [o for o in all_offs
+               if o >= 20 and data[o - 20:o - 8] == LOCALE_ANCHOR]
+    pool = anchored or all_offs
+    if not pool:
+        return None
+    before = [o for o in pool if acp_off is not None and o < acp_off]
+    return max(before) if before else pool[0]
+
+
 def parse_creg_edits(cp):
     """[creg] section: name | current | desired  (name '@' = default value)."""
     out = []
@@ -191,9 +214,11 @@ def parse_creg_edits(cp):
 def creg_patch(data, edits):
     """Apply same-length in-place REG_SZ edits. Returns (new_bytes, report).
 
-    For the unnamed ('@') default value the record appears more than once in a
-    hive; the Nls\\Locale default is the occurrence immediately preceding the
-    Codepage key's ACP value (the Locale key's values precede Codepage's)."""
+    For the unnamed ('@') default value the Nls\\Locale record may appear more
+    than once (a live copy plus a stale copy) and its position relative to the
+    Codepage key varies between releases. select_locale_default() disambiguates
+    it by the Locale value-list anchor, preferring the occurrence before ACP
+    when there is one."""
     out = bytearray(data)
     report = []
     # Anchor: locate the ACP record first (it is unique in both images).
@@ -207,11 +232,9 @@ def creg_patch(data, edits):
         offs = creg_find(out, name, old)
         check(bool(offs), f'creg {key}: current record present')
         if key == '@':
-            before = [o for o in offs if o < acp_off]
-            check(bool(before), f'creg {key}: find occurrence before Codepage key')
-            off = max(before)
-            check(acp_off - off < 0x2000,
-                  f'creg {key}: occurrence belongs to the Nls\\Locale key')
+            off = select_locale_default(out, name, old, acp_off)
+            check(off is not None,
+                  f'creg {key}: Nls\\Locale default record found')
         else:
             check(len(offs) == 1, f'creg {key}: record is unique')
             off = offs[0]
@@ -225,15 +248,13 @@ def creg_patch(data, edits):
 def creg_verify(data, edits):
     """Assert the desired values. For the unnamed ('@') default value, other
     keys legitimately still hold the old value, so scope the check to the
-    occurrence immediately preceding the ACP record (the Nls\\Locale key)."""
+    active Nls\\Locale record (same selector as creg_patch)."""
+    acp = creg_find(data, b'ACP', b'1251')
+    check(bool(acp), 'SYSTEM.DAT: ACP anchor present')
     for key, name, old, new in edits:
         if key == '@':
-            acp = creg_find(data, b'ACP', b'1251')
-            check(bool(acp), 'SYSTEM.DAT: ACP anchor present')
-            candidates = [o for o in creg_find(data, name, old) +
-                          creg_find(data, name, new) if o < acp[0]]
-            check(bool(candidates), f'SYSTEM.DAT: {key} record before ACP')
-            off = max(candidates)
+            off = select_locale_default(data, name, new, acp[0])
+            check(off is not None, f'SYSTEM.DAT: {key} record found')
             d = creg_data_offset(off, name)
             check(data[d:d + len(new)] == new,
                   f'SYSTEM.DAT: {key} = {new.decode()}')
@@ -832,8 +853,11 @@ def verify_usb(cp, args):
     if efi:
         boot = usb_ci_name(fs, efi, 'boot')
         if boot:
-            check('bootx64.efi' in {n.lower() for n in fs.opendir(efi + '/' + boot).listdir()},
-                  'USB has EFI/BOOT/BOOTX64.EFI (UEFI)')
+            efi_names = {n.lower() for n in fs.opendir(efi + '/' + boot).listdir()}
+            # v1.0.0 ships BOOTIA32.EFI, v1.1.0 ships BOOTX64.EFI. Either is
+            # fine; some builds may have no EFI loader at all (legacy BIOS).
+            check(any(n.startswith('boot') and n.endswith('.efi') for n in efi_names),
+                  'USB has EFI/BOOT/BOOT*.EFI (UEFI)')
 
     _root, variants = usb_variants(fs)
     check(bool(variants), 'USB image contains patchable osroots variants')

@@ -252,14 +252,18 @@ Writing that ISO raw to a USB stick (`dd`, Rufus DD mode) leaves a device with
 (USB-HDD) and UEFI USB boot find nothing to boot. This is why it boots in a VM
 but not on real hardware — it is not a regression from the Cyrillic patches.
 
-For real hardware, use the **separate upstream USB image**: download
-`win98qi_v1.1.0_ALL_usb.img` from
+For real hardware, use the **separate upstream USB image**: download a
+`*_usb.img` from
 [oerg866/win98-quickinstall releases](https://github.com/oerg866/win98-quickinstall/releases)
-(MBR partition + FAT32 + syslinux + `EFI/BOOT/BOOTX64.EFI`), then patch it with
-the same recipe:
+(MBR partition + FAT32 + syslinux + EFI loader), then patch it with the same
+recipe. Both **v1.1.0** (`win98qi_v1.1.0_ALL_usb.img`, `BOOTX64.EFI`) and
+**v1.0.0** (`win98qi_v1.0.0_ALL_usb.img`, `BOOTIA32.EFI`) are supported — the
+registry layout differs between them, and the CREG editor handles both:
 
 ```bash
 cd win98-quickinstall
+./sysprep/cyrillic/build.sh --usb=win98qi_v1.0.0_ALL_usb.img
+# -> win98qi_v1.0.0_ALL_usb_cyr.img
 ./sysprep/cyrillic/build.sh --usb=win98qi_v1.1.0_ALL_usb.img
 # -> win98qi_v1.1.0_ALL_usb_cyr.img
 
@@ -268,15 +272,16 @@ python3 sysprep/cyrillic/cyrillize.py --usb <input.img> --out <output.img>
 python3 sysprep/cyrillic/cyrillize.py --verify --usb <output.img>
 
 # write it to the stick (double-check the device!):
-sudo dd if=win98qi_v1.1.0_ALL_usb_cyr.img of=/dev/sdX bs=4M status=progress
+sudo dd if=<output>_cyr.img of=/dev/sdX bs=4M status=progress
 ```
 
 `--usb` copies the image and patches only the four payload files per Win98
 variant (`FULL.866`, `SLOWPNP.866`, `FASTPNP.866`, `win98qi.inf`); the syslinux
 MBR, FAT32 filesystem, kernel and EFI loader are left byte-identical. The
-upstream `ALL` image is multi-variant (98Lite Micro, Stock, Windows ME) — the
-two Windows 98 variants are patched, **Windows ME is skipped** (out of scope).
-`--verify --usb` checks the boot files and every patched variant.
+upstream `ALL` image is multi-variant — the Windows 98 variants are patched
+(v1.0.0: 98Lite Sleek + Stock; v1.1.0: 98Lite Micro + Stock), **Windows ME is
+skipped** (out of scope). `--verify --usb` checks the boot files and every
+patched variant.
 
 Alternatives with no extra file: burn the ISO to a CD/DVD (upstream's recommended
 method), or put the ISO on a [Ventoy](https://www.ventoy.net/) USB stick, which
@@ -511,11 +516,16 @@ all **same-length ASCII**, so they are edited in place:
 
 No key node, pointer, value-count or free-space chain is touched — exactly
 **5 bytes differ**, file size unchanged. This is byte-identical to what
-`regedit` does for those fields (confirmed by diffing its output). The
-`Nls\Locale` default record is disambiguated from other `00000409` defaults by
-taking the occurrence immediately preceding the unique `ACP` record (the
-Locale key's values precede Codepage's) — verified on both stock and 98Lite
-hives.
+`regedit` does for those fields (confirmed by diffing its output).
+
+The `Nls\Locale` default record (`name_len=0`, data `00000409`) can appear more
+than once (a live copy plus a stale copy), and the **key order differs between
+releases**: v1.1.0 and the v1.0.0 Stock variant put the Locale key *before*
+Codepage, while the v1.0.0 98Lite Sleek variant puts it *after*. The selector
+identifies the record by the Locale value-list tail
+(`"0000041E"=""`, 20 bytes earlier) and prefers the occurrence preceding the
+unique `ACP` record when there is one, otherwise takes the first anchored one.
+Verified across v1.0.0 / v1.1.0, Stock / 98Lite and ISO / USB payloads.
 
 **Deliberate difference:** the recipe's `"SystemLocale"="00000419"` is *not*
 written. It is a Win9x-ignored marker (the real system locale is the `Locale`

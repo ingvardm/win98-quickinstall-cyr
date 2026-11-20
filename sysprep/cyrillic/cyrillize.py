@@ -15,8 +15,9 @@
 #    paths (oeminfo.ini / oemlogo.bmp) present in the 98Lite FULL.866.
 #  * Overlay is insert-or-replace: existing entries keep attr/date/time, missing
 #    ones get the fixed [meta] values.  One branch, no per-image implementation.
-#  * SYSTEM.DAT (in SLOWPNP.866 / FASTPNP.866) is patched with the exact
-#    upstream run_regedit() invocation (wine + msdos.exe + regedit.exe).
+#  * SYSTEM.DAT (in SLOWPNP.866 / FASTPNP.866) is patched by a pure-Python
+#    Win9x CREG value editor -- no wine / msdos.exe / regedit.exe needed. The
+#    three functional values are same-length in-place ASCII edits.
 #  * The ISO is rebuilt with pycdlib in-place rm_file/add_fp: every byte of
 #    every other file (incl. El Torito boot.cat / cdrom.img / [BOOT]) is kept.
 #    --rebuild makeiso reproduces the literal PLAN.md step 9 via makeiso.py.
@@ -24,6 +25,7 @@
 #
 # No Microsoft binaries are written into the repository: donor payloads are
 # streamed out of win98ru/BASE4.CAB into a scratch dir under /tmp/opencode.
+# The whole pipeline is wine-free.
 # ---------------------------------------------------------------------------
 
 import argparse
@@ -44,7 +46,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SYSPREP = os.path.dirname(HERE)                 # .../sysprep
 REPO = os.path.dirname(SYSPREP)                 # .../win98-quickinstall
 WORKSPACE = os.path.dirname(REPO)               # .../win98-qi-cyrillic
-REGISTRY = os.path.join(SYSPREP, 'registry')
 RECIPE = os.path.join(HERE, 'recipe.ini')
 
 DONOR_ISO = 'win98se_2222.ru.iso'
@@ -63,8 +64,7 @@ TARGETS = [
 ]
 FULL_NAME, SLOW_NAME, FAST_NAME, INF_NAME = [t[2] for t in TARGETS]
 
-TOOLS = ['git', 'cabextract', '7z', 'python3', 'wine', 'winepath', 'unzip']
-REG_NLS_KEY = r'HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Nls'
+TOOLS = ['git', 'cabextract', '7z', 'python3', 'unzip']
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +125,111 @@ def check(cond, msg):
     if not cond:
         die(msg)
     print('  ok: ' + msg)
+
+
+# ---------------------------------------------------------------------------
+# Windows 9x (CREG) registry value editor -- pure Python, no wine/regedit
+#
+# SYSTEM.DAT / USER.DAT start with 'CREG' and store REG_SZ values as compact
+# records:  [u16 name_len][u16 data_len][name bytes][data bytes]
+# (a default value has an empty name), followed by an 8-byte type/next header.
+# The Cyrillic recipe changes exactly three of these records, and every change
+# is a SAME-LENGTH ASCII replacement (1252->1251, 437->866, 00000409->00000419).
+# Editing those bytes in place is therefore safe: no key node, pointer, hash,
+# value-count or free-space chain is touched.  This is also byte-for-byte what
+# regedit does for those fields (verified by diffing its output); regedit's
+# extra work is only for *adding* the optional "SystemLocale" value, which
+# requires growing the hive and is deliberately omitted here (it is not used
+# by Win9x -- the system locale is the Locale key's default value).
+# ---------------------------------------------------------------------------
+
+def creg_record(name, value):
+    """Exact byte pattern of a Win9x REG_SZ value record."""
+    return struct.pack('<HH', len(name), len(value)) + name + value
+
+
+def creg_find(data, name, value):
+    """Offsets of every record with this name and exact data."""
+    pat = creg_record(name, value)
+    offs = []
+    i = data.find(pat)
+    while i >= 0:
+        offs.append(i)
+        i = data.find(pat, i + 1)
+    return offs
+
+
+def creg_data_offset(off, name):
+    return off + 4 + len(name)
+
+
+def parse_creg_edits(cp):
+    """[creg] section: name | current | desired  (name '@' = default value)."""
+    out = []
+    for key in cp.options('creg'):
+        parts = [p.strip() for p in cp.get('creg', key).split('|')]
+        if len(parts) != 2:
+            raise ValueError(f'creg: bad value for {key}: {cp.get("creg", key)!r}')
+        old, new = parts
+        name = b'' if key == '@' else key.encode('cp1252')
+        out.append((key, name, old.encode('cp1252'), new.encode('cp1252')))
+    return out
+
+
+def creg_patch(data, edits):
+    """Apply same-length in-place REG_SZ edits. Returns (new_bytes, report).
+
+    For the unnamed ('@') default value the record appears more than once in a
+    hive; the Nls\\Locale default is the occurrence immediately preceding the
+    Codepage key's ACP value (the Locale key's values precede Codepage's)."""
+    out = bytearray(data)
+    report = []
+    # Anchor: locate the ACP record first (it is unique in both images).
+    acp_name, acp_old = b'ACP', b'1252'
+    acp_offs = creg_find(out, acp_name, acp_old)
+    check(len(acp_offs) == 1, 'SYSTEM.DAT: unique ACP record found')
+    acp_off = acp_offs[0]
+
+    for key, name, old, new in edits:
+        check(len(old) == len(new), f'creg {key}: same-length edit')
+        offs = creg_find(out, name, old)
+        check(bool(offs), f'creg {key}: current record present')
+        if key == '@':
+            before = [o for o in offs if o < acp_off]
+            check(bool(before), f'creg {key}: find occurrence before Codepage key')
+            off = max(before)
+            check(acp_off - off < 0x2000,
+                  f'creg {key}: occurrence belongs to the Nls\\Locale key')
+        else:
+            check(len(offs) == 1, f'creg {key}: record is unique')
+            off = offs[0]
+        d = creg_data_offset(off, name)
+        out[d:d + len(new)] = new
+        report.append((key, old.decode('ascii'), new.decode('ascii'), off))
+        print(f'  creg: {key} {old.decode()} -> {new.decode()} @ {off:#x}')
+    return bytes(out), report
+
+
+def creg_verify(data, edits):
+    """Assert the desired values. For the unnamed ('@') default value, other
+    keys legitimately still hold the old value, so scope the check to the
+    occurrence immediately preceding the ACP record (the Nls\\Locale key)."""
+    for key, name, old, new in edits:
+        if key == '@':
+            acp = creg_find(data, b'ACP', b'1251')
+            check(bool(acp), 'SYSTEM.DAT: ACP anchor present')
+            candidates = [o for o in creg_find(data, name, old) +
+                          creg_find(data, name, new) if o < acp[0]]
+            check(bool(candidates), f'SYSTEM.DAT: {key} record before ACP')
+            off = max(candidates)
+            d = creg_data_offset(off, name)
+            check(data[d:d + len(new)] == new,
+                  f'SYSTEM.DAT: {key} = {new.decode()}')
+        else:
+            check(bool(creg_find(data, name, new)),
+                  f'SYSTEM.DAT: {key} = {new.decode()}')
+            check(not creg_find(data, name, old),
+                  f'SYSTEM.DAT: old {key} value gone')
 
 
 # ---------------------------------------------------------------------------
@@ -250,24 +355,13 @@ def index_files(mp):
 
 
 # ---------------------------------------------------------------------------
-# Environment / toolchain / pinned hashes
+# Toolchain / pinned hashes   (no wine / regedit / DOS emulator needed)
 # ---------------------------------------------------------------------------
-
-def setup_wine_env():
-    base = '/tmp/opencode' if os.path.isdir('/tmp/opencode') else tempfile.gettempdir()
-    # Stable prefix: shared across the separate cyrillize.py processes in a
-    # build so wine only initialises it once.
-    os.environ.setdefault('WINEPREFIX', os.path.join(base, 'cyrillize-wineprefix'))
-    os.environ.setdefault('WINEDEBUG', '-all')
-
 
 def check_tools():
     for t in TOOLS:
         if shutil.which(t) is None:
             die(f'Missing required tool on PATH: {t}')
-    for f in ('msdos.exe', 'regedit.exe'):
-        if not os.path.isfile(os.path.join(REGISTRY, f)):
-            die(f'Missing registry tool: {os.path.join(REGISTRY, f)}')
     print('  ok: toolchain present (' + ', '.join(TOOLS) + ')')
 
 
@@ -411,80 +505,18 @@ def overlay_full(mp, cp, donors):
 
 
 # ---------------------------------------------------------------------------
-# Win9x SYSTEM.DAT patching via wine (upstream run_regedit() invocation)
+# Win9x SYSTEM.DAT patching -- pure Python (see the CREG section above)
 # ---------------------------------------------------------------------------
 
-def wine_path(path):
-    return subprocess.check_output(['winepath', '-w', path]).decode().strip()
-
-
-def build_reg_bytes(cp):
-    lines = recipe_lines(cp, 'reg', 'lines')
-    return b'\r\n'.join(ln.encode('cp1252') for ln in lines) + b'\r\n\r\n'
-
-
-def run_regedit_import(system_dat, reg_bytes, workdir, tag):
-    d = tempfile.mkdtemp(prefix='regimp_' + tag + '_', dir=workdir)
-    try:
-        with open(os.path.join(d, 'SYSTEM.DAT'), 'wb') as fh:
-            fh.write(system_dat)
-        with open(os.path.join(d, 'cyrillic.reg'), 'wb') as fh:
-            fh.write(reg_bytes)
-        regedit_exe = wine_path(os.path.join(REGISTRY, 'regedit.exe'))
-        reg_file = wine_path(os.path.join(d, 'cyrillic.reg'))
-        cmd = ['wine', os.path.join(REGISTRY, 'msdos.exe'), '-e', regedit_exe,
-               '/L:SYSTEM.DAT', '/R:SYSTEM.DAT', reg_file]
-        subprocess.run(cmd, cwd=d, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with open(os.path.join(d, 'SYSTEM.DAT'), 'rb') as fh:
-            return fh.read()
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-
-
-def run_regedit_export(system_dat, workdir, tag, keypath=REG_NLS_KEY):
-    d = tempfile.mkdtemp(prefix='regexp_' + tag + '_', dir=workdir)
-    try:
-        with open(os.path.join(d, 'SYSTEM.DAT'), 'wb') as fh:
-            fh.write(system_dat)
-        regedit_exe = wine_path(os.path.join(REGISTRY, 'regedit.exe'))
-        # '/E <file> <key>' (space separated, relative filename) is the only
-        # form the 16-bit regedit accepts under msdos.exe. keypath has no spaces.
-        cmd = ['wine', os.path.join(REGISTRY, 'msdos.exe'), '-e', regedit_exe,
-               '/L:SYSTEM.DAT', '/R:SYSTEM.DAT', '/E', 'EXPORT.REG', keypath]
-        subprocess.run(cmd, cwd=d, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with open(os.path.join(d, 'EXPORT.REG'), 'rb') as fh:
-            return fh.read().decode('cp1252', errors='replace')
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-
-
-def parse_reg(text):
-    """Return {section: {value_name: raw_value}} for a REGEDIT4 export."""
-    sections = {}
-    cur = None
-    for line in text.splitlines():
-        line = line.rstrip('\r')
-        s = line.strip()
-        if s.startswith('[') and s.endswith(']'):
-            cur = s[1:-1]
-            sections[cur] = {}
-        elif cur is not None and '=' in line and s.startswith(('"', '@')):
-            k, v = line.split('=', 1)
-            sections[cur][k.strip()] = v.strip()
-    return sections
-
-
-def patch_registry_payload(mp, reg_bytes, workdir, tag):
+def patch_registry_payload(mp, edits, tag):
     check(mp.version == 1, f'{tag}: still MercyPak V1')
     check(len(mp.files) == 1, f'{tag}: exactly one entry')
     f = mp.files[0]
     check(norm(f['path']) == 'windows/system.dat',
           f'{tag}: single entry is WINDOWS/SYSTEM.DAT')
     before = f['data']
-    f['data'] = run_regedit_import(before, reg_bytes, workdir, tag)
-    check(f['data'] != before, f'{tag}: SYSTEM.DAT patched by regedit')
+    f['data'], _report = creg_patch(before, edits)
+    check(f['data'] != before, f'{tag}: SYSTEM.DAT patched in place')
     return mp
 
 
@@ -542,21 +574,19 @@ def make_workdir(out_path):
 
 
 def smoke_test(cp, iso_path, workdir):
-    """PLAN.md section 6 step 0: prove wine/msdos.exe/regedit.exe can import
-    into a real Win9x SYSTEM.DAT before anything else runs."""
-    print('Smoke-testing the fragile wine/regedit dependency:')
+    """PLAN.md section 6 step 0, wine-free: validate the toolchain and prove
+    the pure-Python CREG editor can patch a real Win9x SYSTEM.DAT."""
+    print('Smoke-testing the toolchain and pure-Python registry editor:')
     check_tools()
-    setup_wine_env()
+    edits = parse_creg_edits(cp)
     iso = open_iso(iso_path)
     slow = read_mercypak(read_iso_file(iso, '/osroots/1/SLOWPNP.866', workdir, 'slow'))
     iso.close()
     sysdat = slow.files[0]['data']
-    trivial = (b'REGEDIT4\r\n'
-               b'[HKEY_LOCAL_MACHINE\\Software\\CyrillizeSmokeTest]\r\n'
-               b'"Ping"="1"\r\n\r\n')
-    patched = run_regedit_import(sysdat, trivial, workdir, 'smoke')
-    check(patched != sysdat, 'regedit import modified a scratch SYSTEM.DAT')
-    print('Smoke test PASSED -- wine toolchain is usable.\n')
+    patched, _ = creg_patch(sysdat, edits)
+    check(patched != sysdat, 'CREG editor modified a scratch SYSTEM.DAT')
+    creg_verify(patched, edits)
+    print('Smoke test PASSED -- toolchain and registry editor are usable.\n')
 
 
 def build(cp, args):
@@ -565,13 +595,12 @@ def build(cp, args):
     check(os.path.isfile(iso_path), f'input ISO exists: {iso_path}')
     check(iso_path != out_path, 'input and output paths differ')
     check_tools()
-    setup_wine_env()
     check_pinned_hashes(cp, iso_path)
 
     workdir = make_workdir(out_path)
     try:
-        # Step 0 smoke test on a scratch SYSTEM.DAT extracted from this ISO.
         donors = extract_donors(cp, workdir)
+        edits = parse_creg_edits(cp)
 
         iso = open_iso(iso_path)
         raw = read_all_targets(iso, workdir)
@@ -584,21 +613,15 @@ def build(cp, args):
         check(len(full.files) == struct.unpack_from('<I', raw[FULL_NAME], 8)[0],
               'FULL.866 fileCount matches parsed entries')
 
-        # Build the reg file once, used for both registry payloads.
-        reg_bytes = build_reg_bytes(cp)
-        smoke_sysdat = slow.files[0]['data']
-        check(run_regedit_import(smoke_sysdat, reg_bytes, workdir, 'smoke') != smoke_sysdat,
-              'wine/regedit smoke test on SYSTEM.DAT')
-
         # Overlay FULL.866 and patch WIN.INI / SYSTEM.INI (insert-or-replace).
         overlay_full(full, cp, donors)
         patched = {
             FULL_NAME: write_mercypak(full),
         }
 
-        # Patch both registry payloads separately.
-        patch_registry_payload(slow, reg_bytes, workdir, 'slowpnp')
-        patch_registry_payload(fast, reg_bytes, workdir, 'fastpnp')
+        # Patch both registry payloads separately (pure Python, no wine).
+        patch_registry_payload(slow, edits, 'slowpnp')
+        patch_registry_payload(fast, edits, 'fastpnp')
         patched[SLOW_NAME] = write_mercypak(slow)
         patched[FAST_NAME] = write_mercypak(fast)
 
@@ -638,7 +661,6 @@ def derive_input_iso(out_path):
 def verify(cp, args):
     out_path = resolve(args.iso)
     check(os.path.isfile(out_path), f'output ISO exists: {out_path}')
-    setup_wine_env()
     workdir = make_workdir(out_path + '.verify')
     try:
         # --- ISO level checks ---
@@ -710,22 +732,15 @@ def verify(cp, args):
         check(bool(ud) and b'\x06\x00\x08\x00Locale00000409' in ud[0]['data'],
               'HKCU Control Panel\\International Locale still 00000409')
 
-        # --- registry payloads ---
+        # --- registry payloads (pure-Python CREG value check) ---
         print('SLOWPNP.866 / FASTPNP.866 registries:')
+        edits = parse_creg_edits(cp)
         for name in (SLOW_NAME, FAST_NAME):
             mp = read_mercypak(raw[name])
             check(mp.magic == MERCYPAK_V1, f'{name} is MercyPak V1 (ZIEG)')
             check(len(mp.files) == 1 and norm(mp.files[0]['path']) == 'windows/system.dat',
                   f'{name}: one WINDOWS/SYSTEM.DAT entry')
-            text = run_regedit_export(mp.files[0]['data'], workdir, name.lower())
-            sec = parse_reg(text)
-            cp_sec = sec.get(REG_NLS_KEY + r'\Codepage', {})
-            lo_sec = sec.get(REG_NLS_KEY + r'\Locale', {})
-            check(cp_sec.get('"ACP"') == '"1251"', f'{name}: ACP=1251')
-            check(cp_sec.get('"OEMCP"') == '"866"', f'{name}: OEMCP=866')
-            check(lo_sec.get('@') == '"00000419"', f'{name}: Locale default=00000419')
-            check(lo_sec.get('"SystemLocale"') == '"00000419"',
-                  f'{name}: SystemLocale=00000419')
+            creg_verify(mp.files[0]['data'], edits)
 
         # --- file-list / data diff against the input ISO (if available) ---
         inp = derive_input_iso(out_path)
@@ -733,6 +748,9 @@ def verify(cp, args):
             print('Diff against input ISO (only intended entries may change):')
             iiso = open_iso(inp)
             iraw = read_iso_file(iiso, '/osroots/1/FULL.866', workdir, 'in_full')
+            in_reg = {name: read_mercypak(
+                read_iso_file(iiso, '/osroots/1/' + name, workdir, 'in_' + name))
+                for name in (SLOW_NAME, FAST_NAME)}
             iiso.close()
             ifull = read_mercypak(iraw)
             iidx = index_files(ifull)
@@ -770,6 +788,15 @@ def verify(cp, args):
             for sym in ('windows/fonts/symbole.fon', 'windows/fonts/symbolf.fon'):
                 check(iidx[sym][0]['data'] == idx[sym][0]['data'],
                       f'{sym} unchanged (hash matches input)')
+
+            # Registry payloads are the deterministic pure-Python transformation
+            # of the input SYSTEM.DAT (i.e. only the 5 intended bytes changed).
+            for name in (SLOW_NAME, FAST_NAME):
+                imp = in_reg[name]
+                expected, _ = creg_patch(imp.files[0]['data'], edits)
+                actual = read_mercypak(raw[name]).files[0]['data']
+                check(actual == expected,
+                      f'{name}: SYSTEM.DAT == pure-Python CREG patch of input')
         else:
             print('  note: input ISO not found next to output; skipped full data diff.')
 
@@ -789,13 +816,12 @@ def main():
     ap.add_argument('--out', help='output ISO path (build)')
     ap.add_argument('--verify', action='store_true', help='validate an output ISO')
     ap.add_argument('--smoke-test', action='store_true',
-                    help='only run the wine/regedit smoke test and exit')
+                    help='only run the toolchain/registry-editor smoke test and exit')
     ap.add_argument('--rebuild', choices=['inplace', 'makeiso'], default='inplace',
                     help='ISO rebuild method (default: inplace, preserves all bytes)')
     args = ap.parse_args()
 
     cp = load_recipe()
-    setup_wine_env()
 
     if args.smoke_test:
         if not args.iso:

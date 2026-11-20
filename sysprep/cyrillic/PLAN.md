@@ -1,5 +1,11 @@
 # Cyrillic QuickInstall Fork — Implementation Plan (v2, simplified)
 
+> **Implementation note (post-plan):** `wine` / `msdos.exe` / `regedit.exe` are
+> **no longer required**. `SYSTEM.DAT` is patched by a pure-Python Win9x CREG
+> value editor (three same-length in-place edits; see `README.md` → "Registry
+> patch without wine"). §2 toolchain, §6 step 0 and §7 step 6 below describe
+> the original wine-based design and are kept as the historical spec.
+
 ## 1. Goal
 
 Two **single-variant** QuickInstall ISOs with Cyrillic support baked in at image build

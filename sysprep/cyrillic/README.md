@@ -28,6 +28,44 @@ there is no variant-dropping logic.
 * **No wine / `msdos.exe` / `regedit.exe`** — the registry is patched by a
   pure-Python Win9x CREG editor.
 
+## Why this fork starts from the release ISOs
+
+The two `win98qi_v1.1.0_*.iso` files are **not** reproducible from the git repo
+alone. They are the prebuilt reference images published on
+[upstream's GitHub Releases](https://github.com/oerg866/win98-quickinstall/releases/latest),
+and they bundle two things the repo does not contain:
+
+1. **The compiled framework.** Upstream's root `build.sh` compiles the Linux
+   kernel (two variants), busybox, syslinux, dosfstools, util-linux,
+   tiny-floppy-bootloader, the installer and mercypak, then zips `__BIN__` —
+   a *sysprep environment*. Its last line is literally
+   "Run sysprep.py to build an image." It produces tools, not an ISO.
+   Building it needs every submodule (`.gitmodules` uses SSH URLs and includes
+   the Linux kernel), a cross toolchain (`i486-linux-musl-cross`), `nasm`,
+   `sudo`, and wine (per `BUILDING.md`).
+2. **The Windows 98 installation itself.** `sysprep.py` requires
+   `--osroot <IMG/RAW/VHD/VMDK/VDI>` — a hard disk image containing a *fully
+   set up, patched Windows 9x installation*, prepared by hand in a VM
+   (`IMAGE_CREATION.md`). That disk image is where `FULL.866`,
+   `SLOWPNP.866`, `FASTPNP.866` and `DRIVER.866` come from. It is **not** in
+   the repo (the largest tracked file is 2.8 MB; there are no `*.866` files,
+   no `osroots/`, no disk images) and it cannot be committed — it is
+   Microsoft-covered content.
+
+So this fork is deliberately a **post-processor**: it opens the finished,
+pinned release ISO and replaces exactly four files
+(`FULL.866`, `SLOWPNP.866`, `FASTPNP.866`, `win98qi.inf`), preserving every
+other byte — the compiled kernel, `cdrom.img`, El Torito, `bin/`,
+`driver.ex/`, `extras/`. The pinned hashes and the `--verify` diff are defined
+against those exact release bytes, which is what makes the result reproducible
+without shipping any Windows binaries.
+
+Building from source would trade the two ISOs for **two raw Win98 disk images
+plus a full cross-compilation toolchain** — strictly more work, not less, and
+still dependent on a pre-installed Windows 98 system. That is why
+"full framework rebuild" and "`--cyrillic` in `sysprep.py` for builds from a
+raw OSRoot disk image" are listed as out of scope / deferred.
+
 ## Files
 
 ```

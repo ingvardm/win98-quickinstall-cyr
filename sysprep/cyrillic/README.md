@@ -196,7 +196,8 @@ without it).
   The build always starts from the source ISO you pass; delete the outputs and
   rebuild any time (they are ~1.3 GB and gitignored).
 * Wine, a wineprefix, or `sysprep/registry/*`.
-* Anything in the workspace root outside the repo — documentation only.
+* Anything outside the repo root — the build only reads `win98/` and the ISO
+  you pass, both inside `win98-quickinstall/`.
 
 `--verify` optionally uses the matching original input ISO (auto-derived from
 `*_cyr.iso` → `*.iso`) for its full data diff; if it is missing, all other

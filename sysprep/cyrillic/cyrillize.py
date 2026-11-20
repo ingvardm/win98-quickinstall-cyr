@@ -589,6 +589,27 @@ def smoke_test(cp, iso_path, workdir):
     print('Smoke test PASSED -- toolchain and registry editor are usable.\n')
 
 
+def patch_payloads(cp, donors, edits, raw):
+    """Apply the complete Cyrillic recipe to the four osroots/<variant> payload
+    files. Identical for an ISO (osroots/1) and for a USB image variant.
+    Returns {basename: patched_bytes}."""
+    full = read_mercypak(raw[FULL_NAME])
+    slow = read_mercypak(raw[SLOW_NAME])
+    fast = read_mercypak(raw[FAST_NAME])
+    check(full.version == 2, 'FULL.866 is MercyPak V2 (MRCY)')
+    check(len(full.files) == struct.unpack_from('<I', raw[FULL_NAME], 8)[0],
+          'FULL.866 fileCount matches parsed entries')
+    overlay_full(full, cp, donors)
+    patched = {FULL_NAME: write_mercypak(full)}
+    patch_registry_payload(slow, edits, 'slowpnp')
+    patch_registry_payload(fast, edits, 'fastpnp')
+    patched[SLOW_NAME] = write_mercypak(slow)
+    patched[FAST_NAME] = write_mercypak(fast)
+    patched[INF_NAME] = patch_label(raw[INF_NAME],
+                                    cp.get('meta', 'label_suffix').strip())
+    return patched
+
+
 def build(cp, args):
     iso_path = resolve(args.iso)
     out_path = resolve(args.out)
@@ -603,32 +624,8 @@ def build(cp, args):
 
         iso = open_iso(iso_path)
         raw = read_all_targets(iso, workdir)
+        patched = patch_payloads(cp, donors, edits, raw)
 
-        # Parse payloads.
-        full = read_mercypak(raw[FULL_NAME])
-        slow = read_mercypak(raw[SLOW_NAME])
-        fast = read_mercypak(raw[FAST_NAME])
-        check(full.version == 2, 'FULL.866 is MercyPak V2 (MRCY)')
-        check(len(full.files) == struct.unpack_from('<I', raw[FULL_NAME], 8)[0],
-              'FULL.866 fileCount matches parsed entries')
-
-        # Overlay FULL.866 and patch WIN.INI / SYSTEM.INI (insert-or-replace).
-        overlay_full(full, cp, donors)
-        patched = {
-            FULL_NAME: write_mercypak(full),
-        }
-
-        # Patch both registry payloads separately (pure Python, no wine).
-        patch_registry_payload(slow, edits, 'slowpnp')
-        patch_registry_payload(fast, edits, 'fastpnp')
-        patched[SLOW_NAME] = write_mercypak(slow)
-        patched[FAST_NAME] = write_mercypak(fast)
-
-        # Label.
-        patched[INF_NAME] = patch_label(raw[INF_NAME],
-                                        cp.get('meta', 'label_suffix').strip())
-
-        # Rebuild.
         print(f'Rebuilding ISO ({args.rebuild}) -> {out_path}')
         if args.rebuild == 'makeiso':
             rebuild_makeiso(iso_path, out_path, patched, workdir)
@@ -636,6 +633,111 @@ def build(cp, args):
             rebuild_inplace(iso, patched, out_path)
         iso.close()
         print(f'Wrote {out_path} ({os.path.getsize(out_path)} bytes)\n')
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# USB image (MBR + FAT32) -- the upstream *_usb.img that real hardware boots.
+# An ISO is a CD image (El Torito floppy emulation); writing it raw to USB
+# gives no MBR/partition/ESP, which is why VMs (virtual CD) boot but real
+# BIOS/UEFI USB boot does not. Patching the official USB image keeps its
+# syslinux MBR, FAT32 filesystem and EFI/BOOT/BOOTX64.EFI intact.
+# ---------------------------------------------------------------------------
+
+USB_TARGETS = (FULL_NAME, SLOW_NAME, FAST_NAME, INF_NAME)
+
+
+def usb_fs(path, mode='rb'):
+    from FATtools import Volume, FAT
+    part = Volume.vopen(path, mode, 'partition0')
+    fs = Volume.openvolume(part)
+    if not isinstance(fs, FAT.Dirtable):
+        die(f'{path}: no FAT filesystem found in partition0')
+    return part, fs
+
+
+def usb_close(fs, part):
+    from FATtools import Volume
+    fs.close()
+    Volume.vclose(part)
+
+
+def usb_ci_name(fs, parent, wanted):
+    """Case-insensitive lookup of an entry inside a FAT directory."""
+    d = fs.opendir(parent) if parent else fs
+    for n in d.listdir():
+        if n.lower() == wanted.lower():
+            return n
+    return None
+
+
+def usb_variants(fs):
+    root = usb_ci_name(fs, '', 'osroots')
+    check(root is not None, 'USB image has an osroots/ directory')
+    variants = []
+    for v in sorted(fs.opendir(root).listdir()):
+        base = '%s/%s' % (root, v)
+        have = {n.lower() for n in fs.opendir(base).listdir()}
+        if all(t.lower() in have for t in USB_TARGETS):
+            variants.append((v, base))
+    return root, variants
+
+
+def usb_read_payloads(fs, base):
+    names = {n.lower(): n for n in fs.opendir(base).listdir()}
+    raw = {}
+    for t in USB_TARGETS:
+        fh = fs.open('%s/%s' % (base, names[t.lower()]))
+        raw[t] = bytes(fh.read())
+        fh.close()
+    return raw
+
+
+def usb_write_payloads(fs, base, patched):
+    names = {n.lower(): n for n in fs.opendir(base).listdir()}
+    for t in USB_TARGETS:
+        fh = fs.open('%s/%s' % (base, names[t.lower()]))
+        fh.ftruncate(0)
+        fh.seek(0)
+        fh.write(patched[t])
+        fh.close()
+
+
+def is_win_me(label):
+    up = label.upper()
+    return b'WINDOWS ME' in up or b'MILLENNIUM' in up
+
+
+def build_usb(cp, args):
+    src = resolve(args.usb)
+    out = resolve(args.out)
+    check(os.path.isfile(src), f'input USB image exists: {src}')
+    check(src != out, 'input and output paths differ')
+    check_tools()
+
+    workdir = make_workdir(out)
+    try:
+        donors = extract_donors(cp, workdir)
+        edits = parse_creg_edits(cp)
+
+        print(f'Copying USB image -> {out}')
+        shutil.copyfile(src, out)
+
+        part, fs = usb_fs(out, 'r+b')
+        _root, variants = usb_variants(fs)
+        check(bool(variants), 'USB image contains patchable osroots variants')
+        for v, base in variants:
+            raw = usb_read_payloads(fs, base)
+            if is_win_me(raw[INF_NAME]):
+                print(f'  skip osroots/{v}: Windows ME (out of scope)')
+                continue
+            label = raw[INF_NAME].decode('cp1252', 'replace').strip()
+            print(f'  patch osroots/{v}: {label}')
+            patched = patch_payloads(cp, donors, edits, raw)
+            usb_write_payloads(fs, base, patched)
+        usb_close(fs, part)
+        print(f'Wrote {out} ({os.path.getsize(out)} bytes)\n')
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -659,6 +761,97 @@ def derive_input_iso(out_path):
     return None
 
 
+def check_payloads(cp, raw, tag):
+    """Assert all payload-level checks for one osroots variant. Returns
+    (parsed FULL.866, path index) for the optional input-vs-output diff."""
+    print(f'{tag}: FULL.866 payload:')
+    full = read_mercypak(raw[FULL_NAME])
+    check(full.magic == MERCYPAK_V2, f'{tag}: FULL.866 magic is MRCY')
+    fc = struct.unpack_from('<I', raw[FULL_NAME], 8)[0]
+    check(len(full.files) == fc, f'{tag}: FULL.866 fileCount equals parsed entries')
+    idx = index_files(full)
+
+    fonts = parse_maps(cp, 'fonts')
+    adds = parse_maps(cp, 'adds')
+    marker_w = cp.get('meta', 'win_ini_marker').encode('cp1252')
+    marker_s = cp.get('meta', 'system_ini_marker').encode('cp1252')
+
+    for dest, src, size in fonts:
+        ents = idx.get(norm(dest), [])
+        check(bool(ents) and all(len(e['data']) == size for e in ents),
+              f'{tag}: font present with size {size}: {os.path.basename(dest)}')
+    for dest, src, size in adds:
+        ents = idx.get(norm(dest), [])
+        check(bool(ents) and all(len(e['data']) == size for e in ents),
+              f'{tag}: added file {os.path.basename(dest)} size {size}')
+
+    ub = idx.get('windows/system/unicode.bin')
+    check(bool(ub) and len(ub[0]['data']) == 56057,
+          f'{tag}: UNICODE.BIN present with 56057 bytes')
+    check(marker_w in idx['windows/win.ini'][0]['data'],
+          f'{tag}: WIN.INI contains "MS Sans Serif,0=MS Sans Serif,204"')
+    check(marker_s in idx['windows/system.ini'][0]['data'],
+          f'{tag}: SYSTEM.INI contains "oemansi.bin=xlat866.bin"')
+
+    # Attribute regression check (the 76 hidden/system DOS attrs).
+    msdos = idx.get('msdos.sys')
+    check(bool(msdos) and msdos[0]['attr'] == 0x07,
+          f'{tag}: MSDOS.SYS DOS attr still 0x07')
+    font_dests = {norm(d) for d, _s, _z in fonts}
+    replaced_attrs = [e['attr'] for k in font_dests for e in idx.get(k, [])]
+    check(len(replaced_attrs) >= 15 and all(a == 0x02 for a in replaced_attrs),
+          f'{tag}: all 15 Cyrillic font destinations still DOS attr 0x02')
+
+    ud = idx.get('windows/user.dat')
+    check(bool(ud) and b'\x06\x00\x08\x00Locale00000409' in ud[0]['data'],
+          f'{tag}: HKCU Control Panel\\International Locale still 00000409')
+
+    print(f'{tag}: SLOWPNP.866 / FASTPNP.866 registries:')
+    edits = parse_creg_edits(cp)
+    for name in (SLOW_NAME, FAST_NAME):
+        mp = read_mercypak(raw[name])
+        check(mp.magic == MERCYPAK_V1, f'{tag}: {name} is MercyPak V1 (ZIEG)')
+        check(len(mp.files) == 1 and norm(mp.files[0]['path']) == 'windows/system.dat',
+              f'{tag}: {name}: one WINDOWS/SYSTEM.DAT entry')
+        creg_verify(mp.files[0]['data'], edits)
+    return full, idx, fonts, adds
+
+
+def verify_usb(cp, args):
+    """Validate a patched USB image: boot files + every Win98 variant."""
+    out = resolve(args.usb)
+    check(os.path.isfile(out), f'output USB image exists: {out}')
+    fileout = subprocess.check_output(['file', out]).decode(errors='replace')
+    check('boot sector' in fileout.lower(), "'file' reports a boot sector (MBR)")
+
+    part, fs = usb_fs(out, 'rb')
+    root_names = {n.lower() for n in fs.listdir()}
+    for n in ('ldlinux.sys', 'syslinux.cfg', 'bzimage.cd', 'cdrom.img'):
+        check(n in root_names, f'USB root has {n}')
+    efi = usb_ci_name(fs, '', 'efi')
+    if efi:
+        boot = usb_ci_name(fs, efi, 'boot')
+        if boot:
+            check('bootx64.efi' in {n.lower() for n in fs.opendir(efi + '/' + boot).listdir()},
+                  'USB has EFI/BOOT/BOOTX64.EFI (UEFI)')
+
+    _root, variants = usb_variants(fs)
+    check(bool(variants), 'USB image contains patchable osroots variants')
+    patched_count = 0
+    for v, base in variants:
+        raw = usb_read_payloads(fs, base)
+        if is_win_me(raw[INF_NAME]):
+            print(f'osroots/{v}: Windows ME (untouched, out of scope)')
+            continue
+        check(b'[RU fonts, EN UI]' in raw[INF_NAME],
+              f'osroots/{v}: label has [RU fonts, EN UI] suffix')
+        check_payloads(cp, raw, 'osroots/' + v)
+        patched_count += 1
+    check(patched_count >= 1, f'at least one Win98 variant patched ({patched_count})')
+    usb_close(fs, part)
+    print('\nVERIFY PASSED for ' + out)
+
+
 def verify(cp, args):
     out_path = resolve(args.iso)
     check(os.path.isfile(out_path), f'output ISO exists: {out_path}')
@@ -679,70 +872,9 @@ def verify(cp, args):
         raw = read_all_targets(iso, workdir)
         iso.close()
 
-        # --- FULL.866 ---
-        print('FULL.866 payload:')
-        full = read_mercypak(raw[FULL_NAME])
-        check(full.magic == MERCYPAK_V2, 'FULL.866 magic is MRCY')
-        fc = struct.unpack_from('<I', raw[FULL_NAME], 8)[0]
-        check(len(full.files) == fc, 'FULL.866 fileCount equals parsed entries')
-        idx = index_files(full)
-
-        fonts = parse_maps(cp, 'fonts')
-        adds = parse_maps(cp, 'adds')
-        marker_w = cp.get('meta', 'win_ini_marker').encode('cp1252')
-        marker_s = cp.get('meta', 'system_ini_marker').encode('cp1252')
-
-        # 15 Cyrillic fonts have the recipe sizes; symbols unchanged (vs input).
-        for dest, src, size in fonts:
-            ents = idx.get(norm(dest), [])
-            check(bool(ents) and all(len(e['data']) == size for e in ents),
-                  f'font present with size {size}: {os.path.basename(dest)}')
-
-        # The 4/5 added files present with expected sizes.
-        for dest, src, size in adds:
-            ents = idx.get(norm(dest), [])
-            check(bool(ents) and all(len(e['data']) == size for e in ents),
-                  f'added file {os.path.basename(dest)} size {size}')
-
-        # UNICODE.BIN still present at its expected size (unchanged bytes are
-        # covered by the input-vs-output diff below when the input is available).
-        ub = idx.get('windows/system/unicode.bin')
-        check(bool(ub) and len(ub[0]['data']) == 56057,
-              'UNICODE.BIN present with 56057 bytes')
-
-        # INI markers.
-        check(marker_w in idx['windows/win.ini'][0]['data'],
-              'WIN.INI contains "MS Sans Serif,0=MS Sans Serif,204"')
-        check(marker_s in idx['windows/system.ini'][0]['data'],
-              'SYSTEM.INI contains "oemansi.bin=xlat866.bin"')
-
-        # Attribute regression check. The 15 replaced font destinations must
-        # keep their hidden/system bit (0x02); that is the loss the dedicated
-        # reader/writer prevents. 98Lite additionally ships 7 WST_*.FON at
-        # 0x20 -- those are legitimate and are verified unchanged (attr/date/
-        # time) by the input-vs-output diff below. MSDOS.SYS stays 0x07.
-        msdos = idx.get('msdos.sys')
-        check(bool(msdos) and msdos[0]['attr'] == 0x07, 'MSDOS.SYS DOS attr still 0x07')
-        font_dests = {norm(d) for d, _s, _z in fonts}
-        replaced_attrs = [e['attr'] for k in font_dests for e in idx.get(k, [])]
-        check(len(replaced_attrs) >= 15 and all(a == 0x02 for a in replaced_attrs),
-              'all 15 Cyrillic font destinations still DOS attr 0x02')
-
-        # USER.DAT: HKCU Locale still 00000409 (untouched).
-        print('USER.DAT / English UI:')
-        ud = idx.get('windows/user.dat')
-        check(bool(ud) and b'\x06\x00\x08\x00Locale00000409' in ud[0]['data'],
-              'HKCU Control Panel\\International Locale still 00000409')
-
-        # --- registry payloads (pure-Python CREG value check) ---
-        print('SLOWPNP.866 / FASTPNP.866 registries:')
+        # --- FULL.866 / registry / INI / attr checks ---
+        full, idx, fonts, adds = check_payloads(cp, raw, 'ISO')
         edits = parse_creg_edits(cp)
-        for name in (SLOW_NAME, FAST_NAME):
-            mp = read_mercypak(raw[name])
-            check(mp.magic == MERCYPAK_V1, f'{name} is MercyPak V1 (ZIEG)')
-            check(len(mp.files) == 1 and norm(mp.files[0]['path']) == 'windows/system.dat',
-                  f'{name}: one WINDOWS/SYSTEM.DAT entry')
-            creg_verify(mp.files[0]['data'], edits)
 
         # --- file-list / data diff against the input ISO (if available) ---
         inp = derive_input_iso(out_path)
@@ -818,8 +950,9 @@ def main():
         epilog='Example: build.sh <input.iso>  ->  <stem>_cyr.iso. '
                'See README.md for the recipe and pipeline.')
     ap.add_argument('--iso', help='input ISO (build) or output ISO (--verify)')
-    ap.add_argument('--out', help='output ISO path (build)')
-    ap.add_argument('--verify', action='store_true', help='validate an output ISO')
+    ap.add_argument('--usb', help='input upstream USB .img (build) or output USB .img (--verify)')
+    ap.add_argument('--out', help='output ISO / USB image path (build)')
+    ap.add_argument('--verify', action='store_true', help='validate an output ISO / USB image')
     ap.add_argument('--smoke-test', action='store_true',
                     help='only run the toolchain/registry-editor smoke test and exit')
     ap.add_argument('--rebuild', choices=['inplace', 'makeiso'], default='inplace',
@@ -827,6 +960,16 @@ def main():
     args = ap.parse_args()
 
     cp = load_recipe()
+
+    if args.usb:
+        check(not args.iso, 'use either --iso or --usb, not both')
+        if args.verify:
+            verify_usb(cp, args)
+        else:
+            if not args.out:
+                die('--usb build needs --out')
+            build_usb(cp, args)
+        return
 
     if args.smoke_test:
         if not args.iso:

@@ -33,7 +33,9 @@ drivercopy
 
 # Cyrillic fork local inputs/outputs -- these live in the REPO ROOT and must
 # never be committed. /win98/ is the WIN98 folder extracted from the Russian
-# Win98 SE CD ISO; the root-level patterns cover the QI ISO(s) and outputs.
+# Win98 SE CD ISO; the root-level patterns cover QI ISO/IMG inputs, the
+# generated *_cyr.* outputs, and any loose CABs.
 /win98/
 /*.[iI][sS][oO]
 /*.[cC][aA][bB]
+/*.[iI][mM][gG]

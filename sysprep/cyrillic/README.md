@@ -44,7 +44,8 @@ A lone `BASE4.CAB` yields nothing (its LZX folder spans the other donor CABs),
 so the whole `win98/` folder is required. Everything in `win98/` and the
 root-level `*.iso` files are gitignored. No wine, no submodules, no previous
 outputs. The input's name/version does not matter. Requires `git`, `python3`,
-`cabextract`, `7z`, `file`, `unzip` and Python `pycdlib`.
+`cabextract`, `7z`, `file`, `unzip` and Python `pycdlib` (plus `FATtools` for
+`--usb`, see "Bootable USB" below).
 
 Everything below explains the recipe and pipeline.
 
@@ -144,15 +145,15 @@ way, so keeping it in the repo root is the canonical layout.
 ### Toolchain
 
 `git` (to clone upstream), `cabextract`, `7z`, `python3`, `unzip`, and `file`
-(used by `--verify`). Python dependency: **`pycdlib`** only. The full
-`sysprep/requirements.txt` also installs `FATtools`, `wininfparser`,
-`cabarchive` and `xattr`, but those are only used by upstream's `sysprep.py`
-and are **not needed here**. No wine, no wineprefix, no DOS emulator.
+(used by `--verify`). Python dependencies: **`pycdlib`** for ISO builds and
+**`FATtools`** for `--usb` builds. Both come from `sysprep/requirements.txt`
+(which also installs `wininfparser`, `cabarchive` and `xattr` — those are only
+used by upstream's `sysprep.py`). No wine, no wineprefix, no DOS emulator.
 
 ```bash
 git clone <your-fork-url> win98-quickinstall   # fork containing sysprep/cyrillic/
 cd win98-quickinstall
-pip3 install -r sysprep/requirements.txt       # or just: pip3 install pycdlib
+pip3 install -r sysprep/requirements.txt       # or: pip3 install pycdlib FATtools
 ```
 
 (Cloning bare upstream does **not** include `sysprep/cyrillic/` — either clone
@@ -219,7 +220,7 @@ cd win98-quickinstall                       # the repo root
 ```
 
 Each input produces `<stem>_cyr.iso` next to it. `build.sh --help` lists the
-options (`--rebuild=inplace|makeiso`).
+options (`--rebuild=inplace|makeiso`, `--usb=<file.img>` — see "Bootable USB" below).
 
 `build.sh` runs, in order:
 
@@ -240,6 +241,47 @@ python3 sysprep/cyrillic/cyrillize.py --help
 then the workspace root (legacy). Scratch files go to `/tmp/opencode` (or the
 system temp dir);
 source ISOs are opened read-only and never modified.
+
+## Bootable USB (real hardware)
+
+The `_cyr.iso` output is a **CD image**: ISO 9660 with El Torito **2.88 MB
+floppy emulation** (`cdrom.img`). Upstream documents ISOs as *"written to a CD
+or DVD"* — a VM attaches the file as a virtual CD-ROM, so El Torito works there.
+Writing that ISO raw to a USB stick (`dd`, Rufus DD mode) leaves a device with
+**no MBR, no partition table and no EFI System Partition**, so real BIOS
+(USB-HDD) and UEFI USB boot find nothing to boot. This is why it boots in a VM
+but not on real hardware — it is not a regression from the Cyrillic patches.
+
+For real hardware, use the **separate upstream USB image**: download
+`win98qi_v1.1.0_ALL_usb.img` from
+[oerg866/win98-quickinstall releases](https://github.com/oerg866/win98-quickinstall/releases)
+(MBR partition + FAT32 + syslinux + `EFI/BOOT/BOOTX64.EFI`), then patch it with
+the same recipe:
+
+```bash
+cd win98-quickinstall
+./sysprep/cyrillic/build.sh --usb=win98qi_v1.1.0_ALL_usb.img
+# -> win98qi_v1.1.0_ALL_usb_cyr.img
+
+# or call the tool directly:
+python3 sysprep/cyrillic/cyrillize.py --usb <input.img> --out <output.img>
+python3 sysprep/cyrillic/cyrillize.py --verify --usb <output.img>
+
+# write it to the stick (double-check the device!):
+sudo dd if=win98qi_v1.1.0_ALL_usb_cyr.img of=/dev/sdX bs=4M status=progress
+```
+
+`--usb` copies the image and patches only the four payload files per Win98
+variant (`FULL.866`, `SLOWPNP.866`, `FASTPNP.866`, `win98qi.inf`); the syslinux
+MBR, FAT32 filesystem, kernel and EFI loader are left byte-identical. The
+upstream `ALL` image is multi-variant (98Lite Micro, Stock, Windows ME) — the
+two Windows 98 variants are patched, **Windows ME is skipped** (out of scope).
+`--verify --usb` checks the boot files and every patched variant.
+
+Alternatives with no extra file: burn the ISO to a CD/DVD (upstream's recommended
+method), or put the ISO on a [Ventoy](https://www.ventoy.net/) USB stick, which
+chainloads El Torito on real BIOS/UEFI. `floppy.img` (also on the releases page)
+is upstream's documented fallback for BIOSes that cannot boot USB at all.
 
 ### Version independence
 
@@ -509,7 +551,8 @@ reproducibility check, rather than comparing whole ISO byte streams.
 
 ## `--verify` (static, before any boot test)
 
-Re-parses an output ISO and asserts:
+Re-parses an output ISO and asserts (`--verify --usb <img>` does the equivalent
+for a patched USB image: MBR, syslinux/EFI boot files, and every Win98 variant):
 
 * `file` → ISO 9660 **bootable**; `boot.cat`, `cdrom.img`,
   `[BOOT]/Boot-2.88M.img` present; pycdlib sees an El Torito catalog.
@@ -540,7 +583,8 @@ default.
 
 ## Rollback
 
-Source ISOs are never modified. Delete the generated `*_cyr.iso` files.
+Source ISOs / USB images are never modified (the USB build writes to a copy).
+Delete the generated `*_cyr.iso` / `*_cyr.img` files.
 
 ## Risks / accepted trade-offs
 
@@ -554,6 +598,8 @@ Source ISOs are never modified. Delete the generated `*_cyr.iso` files.
 * `HKCU Locale` accidentally `0419` — excluded, verified.
 * `makeiso.py` losing El Torito — verified `boot.cat` + `[BOOT]`; inplace is
   the default.
+* Writing the ISO raw to USB does not boot on real hardware (no MBR/ESP) —
+  patch the official `*_usb.img` with `--usb` instead; see "Bootable USB".
 * Western accented text renders as Cyrillic; apps with a hardcoded cp1252
   decoder cannot be fixed globally — accepted/documented.
 

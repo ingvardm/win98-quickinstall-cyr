@@ -33,28 +33,52 @@ workspace root (legacy). Outputs are written next to each input.
 Options (passed through to cyrillize.py):
   --rebuild=inplace     (default) preserve every other byte of the ISO
   --rebuild=makeiso     rebuild via upstream makeiso.py
+  --usb=<file.img>      patch the upstream USB image instead of building ISOs;
+                        produces <stem>_cyr.img for real-hardware USB boot
   -h, --help            show this help
 
 Examples:
   ./build.sh win98qi_stock.iso
   ./build.sh win98qi_stock.iso win98qi_micro.iso
   ./build.sh /path/to/any-quickinstall.iso
+  ./build.sh --usb=win98qi_v1.1.0_ALL_usb.img
 
 For a custom output name call cyrillize.py directly:
   python3 "$TOOL" --iso <input.iso> --out <output.iso>
+  python3 "$TOOL" --usb <input.img> --out <output.img>
 EOF
 }
 
 ISOS=()
 OPTS=()
+USB=""
 for arg in "$@"; do
     case "$arg" in
         -h|--help) usage; exit 0 ;;
+        --usb=*) USB="${arg#*=}" ;;
         --rebuild=inplace|--rebuild=makeiso) OPTS+=(--rebuild "${arg#*=}") ;;
         -*) echo "Unknown option: $arg" >&2; usage >&2; exit 1 ;;
         *) ISOS+=("$arg") ;;
     esac
 done
+
+if [ -n "$USB" ]; then
+    [ ${#ISOS[@]} -eq 0 ] || { echo "ERROR: --usb cannot be combined with ISO inputs" >&2; exit 1; }
+    src="$USB"
+    [ -f "$src" ] || src="$REPO/$USB"
+    [ -f "$src" ] || src="$WORKSPACE/$USB"
+    [ -f "$src" ] || { echo "ERROR: input USB image not found: $USB" >&2; exit 1; }
+    out="${src%.*}_cyr.img"
+    cd "$REPO"
+    echo "Repo root: $REPO"
+    echo "=== USB build: $(basename "$src") -> $(basename "$out") ==="
+    "$PY" "$TOOL" --usb "$src" --out "$out"
+    echo "=== USB verify ==="
+    "$PY" "$TOOL" --verify --usb "$out"
+    echo "All done. Generated: $out"
+    echo "Write it to a USB stick with: dd if=$out of=/dev/sdX bs=4M status=progress"
+    exit 0
+fi
 
 if [ ${#ISOS[@]} -eq 0 ]; then
     usage >&2

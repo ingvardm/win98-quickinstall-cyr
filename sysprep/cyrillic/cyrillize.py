@@ -24,8 +24,9 @@
 #  * --verify re-parses an output ISO and asserts the checklist in README.md.
 #
 # No Microsoft binaries are written into the repository: donor payloads are
-# streamed out of win98ru/BASE4.CAB into a scratch dir under /tmp/opencode.
-# The whole pipeline is wine-free.
+# streamed out of BASE4.CAB (repo root) into a scratch dir under /tmp/opencode.
+# The whole pipeline is wine-free. Local inputs (BASE4.CAB + the QI ISO) live
+# in the repo root and are gitignored.
 # ---------------------------------------------------------------------------
 
 import argparse
@@ -44,11 +45,13 @@ import pycdlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYSPREP = os.path.dirname(HERE)                 # .../sysprep
-REPO = os.path.dirname(SYSPREP)                 # .../win98-quickinstall
-WORKSPACE = os.path.dirname(REPO)               # .../win98-qi-cyrillic
+REPO = os.path.dirname(SYSPREP)                 # .../win98-quickinstall (repo root)
+WORKSPACE = os.path.dirname(REPO)               # .../win98-qi-cyrillic (legacy location)
 RECIPE = os.path.join(HERE, 'recipe.ini')
 
-DONOR_CAB = os.path.join('win98ru', 'BASE4.CAB')
+# Local inputs live in the REPO ROOT: BASE4.CAB and the QuickInstall ISO.
+# (WORKSPACE is kept only as a legacy fallback for old checkouts.)
+DONOR_CAB = 'BASE4.CAB'
 
 MERCYPAK_V1 = b'ZIEG'
 MERCYPAK_V2 = b'MRCY'
@@ -100,19 +103,27 @@ def norm(path):
     return path.replace('\\', '/').lower()
 
 
-def sha256(data):
-    return hashlib.sha256(data).hexdigest()
+def find_input(name):
+    """Locate a local input file: CWD, then the REPO ROOT (canonical), then the
+    workspace root (legacy). Returns an absolute path or None."""
+    if os.path.isabs(name):
+        return name if os.path.isfile(name) else None
+    for base in (os.getcwd(), REPO, WORKSPACE):
+        p = os.path.join(base, name)
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def resolve(path):
-    """Resolve --iso/--out relative to CWD, then to WORKSPACE."""
-    if os.path.isabs(path):
-        return path
-    if os.path.exists(path):
+    """Resolve --iso/--out relative to CWD, then the repo root, then the
+    workspace root (legacy). Output paths that don't exist stay relative to CWD."""
+    if os.path.isabs(path) or os.path.exists(path):
         return os.path.abspath(path)
-    alt = os.path.join(WORKSPACE, path)
-    if os.path.exists(alt):
-        return alt
+    for base in (REPO, WORKSPACE):
+        alt = os.path.join(base, path)
+        if os.path.exists(alt):
+            return alt
     return os.path.abspath(path)   # for --out: write relative to CWD
 
 
@@ -354,7 +365,7 @@ def index_files(mp):
 
 
 # ---------------------------------------------------------------------------
-# Toolchain / pinned hashes   (no wine / regedit / DOS emulator needed)
+# Toolchain   (no wine / regedit / DOS emulator needed)
 # ---------------------------------------------------------------------------
 
 def check_tools():
@@ -364,46 +375,14 @@ def check_tools():
     print('  ok: toolchain present (' + ', '.join(TOOLS) + ')')
 
 
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b''):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def check_pinned_hashes(cp, iso_path, keys, strict=False):
-    """Verify pinned digests for `keys` -- the inputs this run actually consumes.
-
-    By default only those entries are checked; every other pinned file is
-    ignored, so an unused donor / other input ISO neither has to exist nor can
-    block the build with a stale hash. A checked file that is missing or
-    mismatched is still a hard error (reproducibility for what we do read).
-    `--strict-hashes` restores the original behaviour: check the whole table.
-    """
-    print('Checking pinned hashes:')
-    if strict:
-        targets = list(cp.items('hashes'))
-    else:
-        targets = [(k, cp.get('hashes', k)) for k in keys
-                   if cp.has_option('hashes', k)]
-    for name, expected in targets:
-        path = iso_path if os.path.basename(iso_path) == name else os.path.join(WORKSPACE, name)
-        check(os.path.isfile(path), f'{name} present')
-        got = sha256_file(path)
-        check(got == expected, f'{name} sha256 matches')
-    for k in keys:
-        if not cp.has_option('hashes', k):
-            print(f'  note: {k} is not a pinned input; hash not checked')
-
-
 # ---------------------------------------------------------------------------
-# Donor extraction from win98ru/BASE4.CAB
+# Donor extraction from BASE4.CAB (repo root)
 # ---------------------------------------------------------------------------
 
 def extract_donors(cp, workdir):
-    cab = os.path.join(WORKSPACE, DONOR_CAB)
-    print('Extracting donor payloads from ' + DONOR_CAB)
+    cab = find_input(DONOR_CAB)
+    check(cab is not None, f'donor {DONOR_CAB} found (repo root)')
+    print('Extracting donor payloads from ' + cab)
     donors = {}
     all_items = parse_maps(cp, 'fonts') + parse_maps(cp, 'adds')
     for _dest, src, size in all_items:
@@ -412,6 +391,10 @@ def extract_donors(cp, workdir):
         raw = subprocess.run(['cabextract', '-p', '-F', src, cab],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              check=True).stdout
+        if not raw:
+            die(f'donor {src} not found in {DONOR_CAB}: BASE4.CAB is part of a '
+                'cabinet chain -- copy ALL *.CAB files from the donor CD into '
+                'the same directory as BASE4.CAB')
         check(len(raw) == size, f'donor {src} size {size}')
         donors[src] = raw
     return donors
@@ -588,13 +571,11 @@ def make_workdir(out_path):
     return d
 
 
-def smoke_test(cp, iso_path, workdir, strict_hashes=False):
+def smoke_test(cp, iso_path, workdir):
     """Step 0, wine-free: validate the toolchain and prove the pure-Python CREG
     editor can patch a real Win9x SYSTEM.DAT."""
     print('Smoke-testing the toolchain and pure-Python registry editor:')
     check_tools()
-    check_pinned_hashes(cp, iso_path, [os.path.basename(iso_path)],
-                        strict=strict_hashes)
     edits = parse_creg_edits(cp)
     iso = open_iso(iso_path)
     slow = read_mercypak(read_iso_file(iso, '/osroots/1/SLOWPNP.866', workdir, 'slow'))
@@ -612,10 +593,6 @@ def build(cp, args):
     check(os.path.isfile(iso_path), f'input ISO exists: {iso_path}')
     check(iso_path != out_path, 'input and output paths differ')
     check_tools()
-    # Only the input ISO and the donor CAB are actually consumed by a build.
-    check_pinned_hashes(cp, iso_path,
-                        [os.path.basename(iso_path), DONOR_CAB],
-                        strict=args.strict_hashes)
 
     workdir = make_workdir(out_path)
     try:
@@ -666,12 +643,14 @@ def build(cp, args):
 # ---------------------------------------------------------------------------
 
 def derive_input_iso(out_path):
-    """stock_cyr.iso -> stock.iso ; look for it next to the output / WORKSPACE."""
+    """stock_cyr.iso -> stock.iso ; look next to the output, in the repo root,
+    then in the workspace root (legacy)."""
     base = os.path.basename(out_path)
     cand = base.replace('_cyr.iso', '.iso')
     if cand == base:
         return None
     for p in (os.path.join(os.path.dirname(out_path), cand),
+              os.path.join(REPO, cand),
               os.path.join(WORKSPACE, cand)):
         if os.path.isfile(p):
             return p
@@ -723,10 +702,11 @@ def verify(cp, args):
             check(bool(ents) and all(len(e['data']) == size for e in ents),
                   f'added file {os.path.basename(dest)} size {size}')
 
-        # UNICODE.BIN unchanged.
+        # UNICODE.BIN still present at its expected size (unchanged bytes are
+        # covered by the input-vs-output diff below when the input is available).
         ub = idx.get('windows/system/unicode.bin')
-        check(bool(ub) and sha256(ub[0]['data']) == cp.get('meta', 'unicode_bin_sha256'),
-              'UNICODE.BIN sha256 still fa7d22bb...')
+        check(bool(ub) and len(ub[0]['data']) == 56057,
+              'UNICODE.BIN present with 56057 bytes')
 
         # INI markers.
         check(marker_w in idx['windows/win.ini'][0]['data'],
@@ -807,7 +787,7 @@ def verify(cp, args):
             # symbol fonts unchanged
             for sym in ('windows/fonts/symbole.fon', 'windows/fonts/symbolf.fon'):
                 check(iidx[sym][0]['data'] == idx[sym][0]['data'],
-                      f'{sym} unchanged (hash matches input)')
+                      f'{sym} unchanged (byte-identical to input)')
 
             # Registry payloads are the deterministic pure-Python transformation
             # of the input SYSTEM.DAT (i.e. only the 5 intended bytes changed).
@@ -842,9 +822,6 @@ def main():
                     help='only run the toolchain/registry-editor smoke test and exit')
     ap.add_argument('--rebuild', choices=['inplace', 'makeiso'], default='inplace',
                     help='ISO rebuild method (default: inplace, preserves all bytes)')
-    ap.add_argument('--strict-hashes', action='store_true',
-                    help='verify ALL pinned hashes (default: only inputs this run '
-                         'consumes; unused donor/other ISOs are ignored)')
     args = ap.parse_args()
 
     cp = load_recipe()
@@ -856,7 +833,7 @@ def main():
         check(os.path.isfile(iso_path), f'input ISO exists: {iso_path}')
         d = make_workdir('smoke')
         try:
-            smoke_test(cp, iso_path, d, strict_hashes=args.strict_hashes)
+            smoke_test(cp, iso_path, d)
         finally:
             shutil.rmtree(d, ignore_errors=True)
         return

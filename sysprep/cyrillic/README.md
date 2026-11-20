@@ -2,28 +2,35 @@
 
 ## Get started
 
-Minimal layout — put everything in one directory:
+Minimal layout — put the donor CABs and the QuickInstall ISO **inside the
+repo root**, not outside it:
 
 ```
-my-build/
-├── win98-quickinstall/          # the fork (git repo)
-│   └── sysprep/cyrillic/        #   this tool: build.sh, cyrillize.py, recipe.ini
-├── win98ru/
-│   └── BASE4.CAB                # the only donor file you need
-└── any-quickinstall.iso         # any single-variant QuickInstall ISO
+win98-quickinstall/              # the fork (git repo) == the repo root
+├── BASE4.CAB                    # donor payload (gitignored)
+├── CATALOG3.CAB, BASE5.CAB, ... # rest of the donor CAB chain (gitignored)
+├── any-quickinstall.iso         # any single-variant QI ISO (gitignored)
+├── any-quickinstall_cyr.iso     # generated output (gitignored)
+└── sysprep/cyrillic/            # the tool
 ```
 
 ```bash
 git clone <your-fork-url> win98-quickinstall   # fork containing sysprep/cyrillic/
+cp /path/to/donor-cd/*.CAB any-quickinstall.iso win98-quickinstall/
+cd win98-quickinstall
 pip3 install pycdlib
-./win98-quickinstall/sysprep/cyrillic/build.sh any-quickinstall.iso
-# -> any-quickinstall_cyr.iso, written next to the input
+./sysprep/cyrillic/build.sh any-quickinstall.iso
+# -> any-quickinstall_cyr.iso, in the repo root
 ```
 
-That's it: the fork, `win98ru/BASE4.CAB`, and the ISO to convert. No other ISOs,
-no wine, no submodules, no previous outputs. The input's name/version does not
-matter. Requires `git`, `python3`, `cabextract`, `7z`, `file`, `unzip` and Python
-`pycdlib`. Everything below explains the recipe and pipeline.
+`BASE4.CAB` is part of a **cabinet chain** (its LZX folder spans the other
+donor CABs), so all `*.CAB` files from the Russian Win98 SE CD must sit next
+to it — a lone `BASE4.CAB` yields nothing. They are all gitignored. No wine,
+no submodules, no previous outputs. The input's name/version does not matter;
+root-level `*.iso` / `*.cab` are gitignored. Requires `git`, `python3`,
+`cabextract`, `7z`, `file`, `unzip` and Python `pycdlib`.
+
+Everything below explains the recipe and pipeline.
 
 Bake Cyrillic support (cp1251 ANSI / cp866 OEM) into **any single-variant**
 Windows 98 SE QuickInstall ISO at **image build time**, keeping the English UI.
@@ -83,13 +90,13 @@ and they bundle two things the repo does not contain:
    no `osroots/`, no disk images) and it cannot be committed — it is
    Microsoft-covered content.
 
-So this fork is deliberately a **post-processor**: it opens the finished,
-pinned release ISO and replaces exactly four files
+So this fork is deliberately a **post-processor**: it opens the finished
+release ISO and replaces exactly four files
 (`FULL.866`, `SLOWPNP.866`, `FASTPNP.866`, `win98qi.inf`), preserving every
 other byte — the compiled kernel, `cdrom.img`, El Torito, `bin/`,
-`driver.ex/`, `extras/`. The pinned hashes and the `--verify` diff are defined
-against those exact release bytes, which is what makes the result reproducible
-without shipping any Windows binaries.
+`driver.ex/`, `extras/`. The `--verify` diff compares against the original
+input ISO, which is what validates the result without shipping any Windows
+binaries.
 
 Building from source would trade the two ISOs for **two raw Win98 disk images
 plus a full cross-compilation toolchain** — strictly more work, not less, and
@@ -102,7 +109,7 @@ raw OSRoot disk image" are listed as out of scope / deferred.
 ```
 win98-quickinstall/sysprep/cyrillic/
 ├── recipe.ini     # all data: font map, added files, reference .reg, CREG edits,
-│                  # INI snippets, pinned hashes, verify constants
+│                  # INI snippets, verify constants
 ├── cyrillize.py   # the tool (MercyPak V1/V2, donor extraction, CREG editor,
 │                  # ISO rebuild, --verify)
 ├── build.sh       # one-command reproduction
@@ -111,8 +118,10 @@ win98-quickinstall/sysprep/cyrillic/
 ```
 
 `build.sh` lives in the fork. It takes the source ISO(s) as arguments and
-resolves them relative to the current directory, then the **workspace root**
-(the parent of `win98-quickinstall/`). Outputs are written next to each input.
+resolves them relative to the current directory, then the **repo root**
+(`win98-quickinstall/`), then the workspace root (legacy). Outputs are written
+next to each input — i.e. in the repo root. `BASE4.CAB` is looked up the same
+way, so keeping it in the repo root is the canonical layout.
 
 ## Requirements
 
@@ -126,7 +135,8 @@ and are **not needed here**. No wine, no wineprefix, no DOS emulator.
 
 ```bash
 git clone <your-fork-url> win98-quickinstall   # fork containing sysprep/cyrillic/
-pip3 install -r win98-quickinstall/sysprep/requirements.txt   # or just: pip3 install pycdlib
+cd win98-quickinstall
+pip3 install -r sysprep/requirements.txt       # or just: pip3 install pycdlib
 ```
 
 (Cloning bare upstream does **not** include `sysprep/cyrillic/` — either clone
@@ -136,65 +146,61 @@ On PEP 668 ("externally managed") systems add `--break-system-packages`.
 A plain clone is enough — **do not** use `--recurse-submodules`
 (`.gitmodules` uses SSH URLs and pulls in the Linux kernel; none of it is used).
 
-### Files outside the git repo
+### Input files (inside the repo root)
 
-These live in the workspace root (or under `win98ru/`).
+`BASE4.CAB`, the rest of the donor CAB chain and the QuickInstall ISO all
+live in the **repo root** (`win98-quickinstall/`). The repo's `.gitignore`
+ignores root-level `*.iso` and `*.cab` (case-insensitively), so none of them
+are committed.
 
-| File | Purpose | Actually read? |
+| File (repo root) | Purpose | Actually read? |
 |---|---|---|
+| `BASE4.CAB` | donor fonts / NLS payloads (20 files) | **yes** |
+| all other donor `*.CAB` files | required: BASE4.CAB's LZX folder spans the cabinet chain | **yes** (by cabextract) |
 | any single-variant QuickInstall `*.iso` | the image you pass to `build.sh` | **yes** |
-| `win98ru/BASE4.CAB` | donor fonts / NLS payloads (20 files) | **yes** |
-| `win98se_2222.ru.iso` | donor Russian Win98 SE CD (provenance only) | **no** — never opened |
+| `win98se_2222.ru.iso` | donor Russian Win98 SE CD (optional) | **no** — never opened |
 
 The `win98qi_v1.1.0_*.iso` files are just the two reference images used for
 development/validation — the build has **no dependency on their names or
 version**. Any single-variant QuickInstall ISO can be passed.
 
-**The hash gate is relaxed and version-independent.** `cyrillize.py` only
-verifies the inputs the current run actually consumes: `win98ru/BASE4.CAB`
-always, plus `--iso` if its basename happens to be a known release listed in
-`[hashes]`. An unlisted ISO (any version, any name) is used without a hash.
-Unused pinned files are ignored entirely — they need not be present and cannot
-block a build with a stale hash. A file that *is* checked and is missing or
-mismatched is still a hard error.
-
-Pass `--strict-hashes` to restore the original behaviour (verify the whole
-`[hashes]` table, requiring all four). `--verify` never runs the hash gate —
-it validates the output ISO directly.
+**No hash checks.** Inputs are not pinned or verified by digest: any
+single-variant QuickInstall ISO (any name/version) and the donor CABs are used
+as-is. `--verify` validates the *output* ISO directly, and optionally uses the
+matching original input for its full data diff (all other checks still pass
+without it).
 
 **Not needed:**
 
-* The other 93 files in `win98ru/` — only `BASE4.CAB` is used.
-* `win98se_2222.ru.iso` — never read; optional (checked only with
-  `--strict-hashes`).
+* `win98se_2222.ru.iso` — never read; optional.
 * The generated `*_cyr.iso` outputs — they are *products*, never build inputs.
   The build always starts from the source ISO you pass; delete the outputs and
   rebuild any time (they are ~1.3 GB and gitignored).
 * Wine, a wineprefix, or `sysprep/registry/*`.
-* `README.md` / `.gitignore` in the workspace root — documentation only.
+* Anything in the workspace root outside the repo — documentation only.
 
 `--verify` optionally uses the matching original input ISO (auto-derived from
 `*_cyr.iso` → `*.iso`) for its full data diff; if it is missing, all other
 checks still run and verification still passes (a note is printed).
 
 **Do I still need all the ISOs?** No. To build one image you need only that
-one source ISO plus `win98ru/BASE4.CAB` — and you do **not** need the
+one source ISO plus the donor CAB set (all in the repo root) — and you do **not** need the
 `*_cyr.iso` outputs. Pass several ISOs to `build.sh` to build them all in one
 run.
 
 ## Quickstart
 
 ```bash
-cd /home/igor/win98-qi-cyrillic
-./win98-quickinstall/sysprep/cyrillic/build.sh <input.iso> [<input2.iso> ...]
+cd win98-quickinstall                       # the repo root
+./sysprep/cyrillic/build.sh <input.iso> [<input2.iso> ...]
 # e.g.
-./win98-quickinstall/sysprep/cyrillic/build.sh win98qi_v1.1.0_stock.iso
-./win98-quickinstall/sysprep/cyrillic/build.sh win98qi_v1.1.0_stock.iso win98qi_v1.1.0_micro_directx81.iso
-./win98-quickinstall/sysprep/cyrillic/build.sh /mnt/isos/my-custom-build.iso
+./sysprep/cyrillic/build.sh win98qi_v1.1.0_stock.iso
+./sysprep/cyrillic/build.sh win98qi_v1.1.0_stock.iso win98qi_v1.1.0_micro_directx81.iso
+./sysprep/cyrillic/build.sh /mnt/isos/my-custom-build.iso
 ```
 
 Each input produces `<stem>_cyr.iso` next to it. `build.sh --help` lists the
-options (`--strict-hashes`, `--rebuild=inplace|makeiso`).
+options (`--rebuild=inplace|makeiso`).
 
 `build.sh` runs, in order:
 
@@ -205,24 +211,23 @@ options (`--strict-hashes`, `--rebuild=inplace|makeiso`).
 Manual invocation (use this for a custom output name):
 
 ```bash
-python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --smoke-test --iso <input.iso>
-python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --iso <input.iso> --out <output>_cyr.iso
-python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --verify --iso <output>_cyr.iso
-python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --help
-python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --strict-hashes --iso <input.iso> --out <output>_cyr.iso
+python3 sysprep/cyrillic/cyrillize.py --smoke-test --iso <input.iso>
+python3 sysprep/cyrillic/cyrillize.py --iso <input.iso> --out <output>_cyr.iso
+python3 sysprep/cyrillic/cyrillize.py --verify --iso <output>_cyr.iso
+python3 sysprep/cyrillic/cyrillize.py --help
 ```
 
-`--iso`/`--out` resolve relative to the current directory, falling back to the
-workspace root. Scratch files go to `/tmp/opencode` (or the system temp dir);
+`--iso`/`--out` resolve relative to the current directory, then the repo root,
+then the workspace root (legacy). Scratch files go to `/tmp/opencode` (or the
+system temp dir);
 source ISOs are opened read-only and never modified.
 
 ### Version independence
 
 Nothing in the code or recipe is tied to `v1.1.0`. `build.sh` takes the ISO as
 an argument, derives `<stem>_cyr.iso`, and `cyrillize.py` works purely on the
-ISO's contents (`osroots/1/*.866`, `win98qi.inf`). The pinned `[hashes]`
-entries are only reference digests for the known release images: in the default
-relaxed mode an unlisted ISO is accepted without a hash. The recipe's font,
+ISO's contents (`osroots/1/*.866`, `win98qi.inf`). No input is pinned or
+hash-verified. The recipe's font,
 NLS and CREG edits target structural Windows 9x paths (WINDOWS/FONTS, WIN.INI,
 SYSTEM.INI, `Nls\Codepage`, `Nls\Locale`), which are stable across QuickInstall
 releases; `--verify` still checks every expected value on the output.
@@ -240,7 +245,7 @@ and they are why the implementation looks the way it does:
 * `WINDOWS\USER.DAT` lives **inside `FULL.866`** (94,240 B stock /
   24,608 B 98Lite).
 * `WINDOWS\SYSTEM\UNICODE.BIN` is already byte-identical to the Russian CD's
-  (56,057 B, sha256 `fa7d22bb…`, 30 codepages incl. 1251 and 866) — **no
+  (56,057 B, 30 codepages incl. 1251 and 866) — **no
   replacement needed**; the IFSMGR fallback that corrupted filenames on a live
   install is already absent.
 * All `cp_*.nls`, `locale.nls`, `unicode.nls`, `intl.cpl`, `keybrd3.sys`,
@@ -365,18 +370,19 @@ TTFs resolve cp1251 bytes to U+0410-range codepoints, so it is unnecessary.
 `cyrillize.py` runs these stages. Everything is deterministic and driven by
 `recipe.ini`.
 
-### 1. Pinned hashes
+### 1. Input check
 
-SHA-256 of the inputs this run consumes (`win98ru/BASE4.CAB` and `--iso` if
-listed in `[hashes]`) is checked; a mismatch aborts. An unlisted ISO is
-accepted without a hash, so the build is version-independent.
-`--strict-hashes` checks all four entries. `--out` must differ from `--iso`.
+No hashes are pinned or verified — any single-variant QuickInstall ISO is
+accepted as-is. `--out` must differ from `--iso`.
 
 ### 2. Donor extraction
 
-The 20 donor files are streamed out of `win98ru/BASE4.CAB` with
+The 20 donor files are streamed out of `BASE4.CAB` (repo root) with
 `cabextract -p -F <name>`, renamed per the tables above, and each size is
-verified. Nothing is written into the repository.
+verified. `BASE4.CAB` is part of a cabinet chain, so every `*.CAB` from the
+donor CD must sit next to it or `cabextract` returns nothing; the tool fails
+with a clear message if the chain is missing. Nothing is written into the
+repository.
 
 ### 3. Reading the ISO
 
@@ -416,7 +422,8 @@ not a dict keyed by lowercase path. This:
 * keeps the build deterministic — no filesystem mtimes are read for payload
   metadata; new files get the fixed `[meta]` values.
 
-The V2 writer regenerates dedup groups by hashing data, capped at 8.
+The V2 writer regenerates dedup groups by grouping identical file data,
+ capped at 8.
 
 ### 6. Insert-or-replace overlay into `FULL.866`
 
@@ -479,7 +486,7 @@ are irrelevant. All four patched payloads are byte-for-byte identical across
 runs. The ISO *byte stream* is not guaranteed identical: pycdlib stamps the
 volume descriptor's modification time with the build time (a handful of bytes
 in the PVD). That is why `--verify` — which re-parses payload contents — is the
-reproducibility check, not an output hash.
+reproducibility check, rather than comparing whole ISO byte streams.
 
 ## `--verify` (static, before any boot test)
 
@@ -489,8 +496,8 @@ Re-parses an output ISO and asserts:
   `[BOOT]/Boot-2.88M.img` present; pycdlib sees an El Torito catalog.
 * `FULL.866` magic `MRCY`; `fileCount` equals parsed entries.
 * all 15 fonts have the Cyrillic sizes; `SYMBOLE.FON`/`SYMBOLF.FON` unchanged.
-* the 4/5 added files present with expected sizes; `UNICODE.BIN` still
-  sha256 `fa7d22bb…`.
+* the 4/5 added files present with expected sizes; `UNICODE.BIN` present
+  with 56057 bytes.
 * `WIN.INI` contains `MS Sans Serif,0=MS Sans Serif,204`; `SYSTEM.INI`
   contains `oemansi.bin=xlat866.bin`.
 * `SLOWPNP.866`/`FASTPNP.866` still V1 with one `WINDOWS/SYSTEM.DAT`; the

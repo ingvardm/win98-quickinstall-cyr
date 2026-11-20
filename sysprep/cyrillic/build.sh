@@ -5,13 +5,15 @@
 #   ./build.sh <input.iso> [input2.iso ...]
 #
 # Each input produces <stem>_cyr.iso next to it. Nothing here is tied to a
-# release version, filename or hash: any single-variant QuickInstall ISO works.
+# release version or filename: any single-variant QuickInstall ISO works, and
+# no input hashes are checked.
 # See README.md (in this directory) for the recipe and pipeline.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(cd "$HERE/../../.." && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"          # repo root (canonical input location)
 TOOL="$HERE/cyrillize.py"
 PY="${PYTHON:-python3}"
 
@@ -25,11 +27,10 @@ Output: <stem>_cyr.iso, written next to the input
 
 Nothing is tied to a release version: any single-variant QuickInstall ISO
 can be passed. Input paths are resolved relative to the current directory,
-then to the workspace root.
+then to the REPO ROOT (where BASE4.CAB and the ISOs live), then to the
+workspace root (legacy). Outputs are written next to each input.
 
 Options (passed through to cyrillize.py):
-  --strict-hashes       verify ALL pinned hashes (default: only the donor CAB
-                        plus --iso if its name is a known release)
   --rebuild=inplace     (default) preserve every other byte of the ISO
   --rebuild=makeiso     rebuild via upstream makeiso.py
   -h, --help            show this help
@@ -49,7 +50,6 @@ OPTS=()
 for arg in "$@"; do
     case "$arg" in
         -h|--help) usage; exit 0 ;;
-        --strict-hashes) OPTS+=(--strict-hashes) ;;
         --rebuild=inplace|--rebuild=makeiso) OPTS+=(--rebuild "${arg#*=}") ;;
         -*) echo "Unknown option: $arg" >&2; usage >&2; exit 1 ;;
         *) ISOS+=("$arg") ;;
@@ -61,11 +61,13 @@ if [ ${#ISOS[@]} -eq 0 ]; then
     exit 1
 fi
 
-# Resolve each input to an absolute path (relative to CWD, then workspace).
+# Resolve each input to an absolute path (CWD, then repo root, then workspace).
 resolve_iso() {
     local a="$1"
     if [ -f "$a" ]; then
         echo "$(cd "$(dirname "$a")" && pwd)/$(basename "$a")"
+    elif [ -f "$REPO/$a" ]; then
+        echo "$REPO/$a"
     elif [ -f "$WORKSPACE/$a" ]; then
         echo "$WORKSPACE/$a"
     else
@@ -79,8 +81,8 @@ for iso in "${ISOS[@]}"; do
     SRCS+=("$(resolve_iso "$iso")")
 done
 
-cd "$WORKSPACE"
-echo "Workspace: $WORKSPACE"
+cd "$REPO"
+echo "Repo root: $REPO"
 echo
 
 echo "=== Step 0: toolchain / registry-editor smoke test ==="

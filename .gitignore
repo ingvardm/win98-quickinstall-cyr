@@ -30,3 +30,9 @@ installer/lunmercy
 __BIN__
 bzImage.*
 drivercopy
+
+# Cyrillic fork local inputs/outputs -- these live in the REPO ROOT and must
+# never be committed (multi-GB ISOs and the donor CAB). Anchored to the root
+# and case-insensitive (BASE4.CAB, *.iso, *_cyr.iso, ...).
+/*.[iI][sS][oO]
+/*.[cC][aA][bB]

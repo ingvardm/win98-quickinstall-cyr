@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # ---------------------------------------------------------------------------
-# cyrillize.py -- bake Cyrillic (cp1251 / cp866) support into the Windows 98
-#                 QuickInstall ISOs at image build time (English UI preserved).
+# cyrillize.py -- bake Cyrillic (cp1251 / cp866) support into a Windows 98
+#                 QuickInstall ISO at image build time (English UI preserved).
 #
-# Implements the design documented in README.md. One tool, one recipe.ini, two inputs:
-#   win98qi_v1.1.0_stock.iso           -> win98qi_v1.1.0_stock_cyr.iso
-#   win98qi_v1.1.0_micro_directx81.iso -> win98qi_v1.1.0_micro_directx81_cyr.iso
+# Implements the design documented in README.md. One tool, one recipe.ini.
+# Any single-variant QuickInstall ISO is accepted; the output is conventionally
+# named <stem>_cyr.iso (see build.sh). No release version is hardcoded.
 #
 # Design notes
 #  * MercyPak V1 (ZIEG) / V2 (MRCY) reader+writer lives here.  Entries are kept
@@ -831,7 +831,10 @@ def verify(cp, args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Bake Cyrillic support into a Win98 QuickInstall ISO.')
+        description='Bake Cyrillic support into any single-variant Win98 '
+                    'QuickInstall ISO (version-independent).',
+        epilog='Example: build.sh <input.iso>  ->  <stem>_cyr.iso. '
+               'See README.md for the recipe and pipeline.')
     ap.add_argument('--iso', help='input ISO (build) or output ISO (--verify)')
     ap.add_argument('--out', help='output ISO path (build)')
     ap.add_argument('--verify', action='store_true', help='validate an output ISO')

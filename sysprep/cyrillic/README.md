@@ -1,18 +1,24 @@
 # Cyrillic QuickInstall fork — how it works
 
-Two **single-variant**, **English-UI** Windows 98 SE QuickInstall ISOs with
-Cyrillic support (cp1251 ANSI / cp866 OEM) baked in **at image build time**.
+Bake Cyrillic support (cp1251 ANSI / cp866 OEM) into **any single-variant**
+Windows 98 SE QuickInstall ISO at **image build time**, keeping the English UI.
 The fonts, NLS files, INI edits and codepage/locale registry values come
 verbatim from Microsoft's own Russian Windows 98 SE `[CP866]` / `[CopyDat866]`
 recipe. Nothing in the shell / Explorer resources is changed.
 
-| Input | Output |
-|---|---|
-| `win98qi_v1.1.0_stock.iso` | `win98qi_v1.1.0_stock_cyr.iso` |
-| `win98qi_v1.1.0_micro_directx81.iso` | `win98qi_v1.1.0_micro_directx81_cyr.iso` |
+`build.sh` takes the source ISO(s) as arguments and derives the output name:
 
-Windows ME is skipped. Both inputs are already single-variant (`osroots/1`), so
-there is no variant-dropping logic.
+```bash
+./build.sh win98qi_v1.1.0_stock.iso                 # -> win98qi_v1.1.0_stock_cyr.iso
+./build.sh /path/to/any-quickinstall.iso            # -> any-quickinstall_cyr.iso
+./build.sh stock.iso micro.iso                      # builds both
+```
+
+**Nothing is tied to a release version.** The two `win98qi_v1.1.0_*.iso` files
+are simply the reference images used for development/validation; the tool only
+assumes the ISO is a single-variant QuickInstall image (`osroots/1`) with the
+usual Windows 9x tree. Windows ME is skipped. There is no variant-dropping
+logic.
 
 ## Goals and constraints
 
@@ -79,8 +85,9 @@ win98-quickinstall/sysprep/cyrillic/
 └── README.md      # this file
 ```
 
-`build.sh` lives in the fork; it resolves everything relative to the **workspace
-root** (the parent of `win98-quickinstall/`), where the input ISOs live.
+`build.sh` lives in the fork. It takes the source ISO(s) as arguments and
+resolves them relative to the current directory, then the **workspace root**
+(the parent of `win98-quickinstall/`). Outputs are written next to each input.
 
 ## Requirements
 
@@ -107,17 +114,21 @@ These live in the workspace root (or under `win98ru/`).
 
 | File | Purpose | Actually read? |
 |---|---|---|
-| `win98qi_v1.1.0_stock.iso` | input for build 1 + smoke test | **yes** |
-| `win98qi_v1.1.0_micro_directx81.iso` | input for build 2 | **yes** |
+| any single-variant QuickInstall `*.iso` | the image you pass to `build.sh` | **yes** |
 | `win98ru/BASE4.CAB` | donor fonts / NLS payloads (20 files) | **yes** |
 | `win98se_2222.ru.iso` | donor Russian Win98 SE CD (provenance only) | **no** — never opened |
 
-**The hash gate is relaxed.** `cyrillize.py` only verifies the inputs the
-current run actually consumes, so building the stock image needs just
-`win98qi_v1.1.0_stock.iso` + `win98ru/BASE4.CAB`. Unused pinned files (the
-other input ISO and the donor CD ISO) are ignored entirely — they need not be
-present and cannot block a build with a stale hash. A file that *is* checked
-and is missing or mismatched is still a hard error.
+The `win98qi_v1.1.0_*.iso` files are just the two reference images used for
+development/validation — the build has **no dependency on their names or
+version**. Any single-variant QuickInstall ISO can be passed.
+
+**The hash gate is relaxed and version-independent.** `cyrillize.py` only
+verifies the inputs the current run actually consumes: `win98ru/BASE4.CAB`
+always, plus `--iso` if its basename happens to be a known release listed in
+`[hashes]`. An unlisted ISO (any version, any name) is used without a hash.
+Unused pinned files are ignored entirely — they need not be present and cannot
+block a build with a stale hash. A file that *is* checked and is missing or
+mismatched is still a hard error.
 
 Pass `--strict-hashes` to restore the original behaviour (verify the whole
 `[hashes]` table, requiring all four). `--verify` never runs the hash gate —
@@ -129,8 +140,8 @@ it validates the output ISO directly.
 * `win98se_2222.ru.iso` — never read; optional (checked only with
   `--strict-hashes`).
 * The generated `*_cyr.iso` outputs — they are *products*, never build inputs.
-  The build always starts from the pristine upstream ISOs; delete the outputs
-  and rebuild any time (they are ~1.3 GB and gitignored).
+  The build always starts from the source ISO you pass; delete the outputs and
+  rebuild any time (they are ~1.3 GB and gitignored).
 * Wine, a wineprefix, or `sysprep/registry/*`.
 * `README.md` / `.gitignore` in the workspace root — documentation only.
 
@@ -139,41 +150,59 @@ it validates the output ISO directly.
 checks still run and verification still passes (a note is printed).
 
 **Do I still need all the ISOs?** No. To build one image you need only that
-one pristine input ISO plus `win98ru/BASE4.CAB` — and you do **not** need the
-`*_cyr.iso` outputs. If you want both outputs, run `build.sh` with both input
-ISOs present.
+one source ISO plus `win98ru/BASE4.CAB` — and you do **not** need the
+`*_cyr.iso` outputs. Pass several ISOs to `build.sh` to build them all in one
+run.
 
 ## Quickstart
 
 ```bash
 cd /home/igor/win98-qi-cyrillic
-./win98-quickinstall/sysprep/cyrillic/build.sh
+./win98-quickinstall/sysprep/cyrillic/build.sh <input.iso> [<input2.iso> ...]
+# e.g.
+./win98-quickinstall/sysprep/cyrillic/build.sh win98qi_v1.1.0_stock.iso
+./win98-quickinstall/sysprep/cyrillic/build.sh win98qi_v1.1.0_stock.iso win98qi_v1.1.0_micro_directx81.iso
+./win98-quickinstall/sysprep/cyrillic/build.sh /mnt/isos/my-custom-build.iso
 ```
+
+Each input produces `<stem>_cyr.iso` next to it. `build.sh --help` lists the
+options (`--strict-hashes`, `--rebuild=inplace|makeiso`).
 
 `build.sh` runs, in order:
 
 1. `--smoke-test` — validates the toolchain and proves the CREG editor can
-   patch a real `SYSTEM.DAT`.
-2. build stock → 3. build 98Lite → 4. `--verify` stock → 5. `--verify` 98Lite.
+   patch a real `SYSTEM.DAT` (on the first input).
+2. build each input ISO → 3. `--verify` each output.
 
-Manual invocation:
+Manual invocation (use this for a custom output name):
 
 ```bash
-python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --smoke-test --iso win98qi_v1.1.0_stock.iso
-python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --iso <input>.iso --out <output>_cyr.iso
+python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --smoke-test --iso <input.iso>
+python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --iso <input.iso> --out <output>_cyr.iso
 python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --verify --iso <output>_cyr.iso
 python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --help
-python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --strict-hashes --iso <input>.iso --out <output>_cyr.iso
+python3 win98-quickinstall/sysprep/cyrillic/cyrillize.py --strict-hashes --iso <input.iso> --out <output>_cyr.iso
 ```
 
 `--iso`/`--out` resolve relative to the current directory, falling back to the
 workspace root. Scratch files go to `/tmp/opencode` (or the system temp dir);
 source ISOs are opened read-only and never modified.
 
+### Version independence
+
+Nothing in the code or recipe is tied to `v1.1.0`. `build.sh` takes the ISO as
+an argument, derives `<stem>_cyr.iso`, and `cyrillize.py` works purely on the
+ISO's contents (`osroots/1/*.866`, `win98qi.inf`). The pinned `[hashes]`
+entries are only reference digests for the known release images: in the default
+relaxed mode an unlisted ISO is accepted without a hash. The recipe's font,
+NLS and CREG edits target structural Windows 9x paths (WINDOWS/FONTS, WIN.INI,
+SYSTEM.INI, `Nls\Codepage`, `Nls\Locale`), which are stable across QuickInstall
+releases; `--verify` still checks every expected value on the output.
+
 ## Verified facts that constrain the design
 
-These were established by parsing the pinned inputs read-only, and they are why
-the implementation looks the way it does:
+These were established by parsing the two `v1.1.0` reference images read-only,
+and they are why the implementation looks the way it does:
 
 * Both ISOs are already single-variant (`osroots/1` only).
 * `FULL.866` is MercyPak **V2** (`MRCY`): stock 146 dirs / 2046 files /
@@ -310,9 +339,10 @@ TTFs resolve cp1251 bytes to U+0410-range codepoints, so it is unnecessary.
 
 ### 1. Pinned hashes
 
-SHA-256 of the inputs this run consumes (`--iso` and `win98ru/BASE4.CAB`) is
-checked against `[hashes]`; a mismatch aborts. `--strict-hashes` checks all
-four entries. `--out` must differ from `--iso`.
+SHA-256 of the inputs this run consumes (`win98ru/BASE4.CAB` and `--iso` if
+listed in `[hashes]`) is checked; a mismatch aborts. An unlisted ISO is
+accepted without a hash, so the build is version-independent.
+`--strict-hashes` checks all four entries. `--out` must differ from `--iso`.
 
 ### 2. Donor extraction
 

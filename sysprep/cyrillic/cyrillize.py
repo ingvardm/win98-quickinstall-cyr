@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# cyrillize.py -- bake Cyrillic (cp1251 / cp866) support into the Windows 98
+#                 QuickInstall ISOs at image build time (English UI preserved).
+#
+# Implements PLAN.md (v2, simplified).  One tool, one recipe.ini, two inputs:
+#   win98qi_v1.1.0_stock.iso           -> win98qi_v1.1.0_stock_cyr.iso
+#   win98qi_v1.1.0_micro_directx81.iso -> win98qi_v1.1.0_micro_directx81_cyr.iso
+#
+# Design notes
+#  * MercyPak V1 (ZIEG) / V2 (MRCY) reader+writer lives here.  Entries are kept
+#    as an ORDERED LIST (not a dict) and every entry retains its DOS
+#    attr / dosDate / dosTime.  This preserves the 76 hidden/system attributes
+#    and keeps the build deterministic.  It also preserves the two duplicate
+#    paths (oeminfo.ini / oemlogo.bmp) present in the 98Lite FULL.866.
+#  * Overlay is insert-or-replace: existing entries keep attr/date/time, missing
+#    ones get the fixed [meta] values.  One branch, no per-image implementation.
+#  * SYSTEM.DAT (in SLOWPNP.866 / FASTPNP.866) is patched with the exact
+#    upstream run_regedit() invocation (wine + msdos.exe + regedit.exe).
+#  * The ISO is rebuilt with pycdlib in-place rm_file/add_fp: every byte of
+#    every other file (incl. El Torito boot.cat / cdrom.img / [BOOT]) is kept.
+#    --rebuild makeiso reproduces the literal PLAN.md step 9 via makeiso.py.
+#  * --verify re-parses an output ISO and asserts everything from PLAN.md sec 8.
+#
+# No Microsoft binaries are written into the repository: donor payloads are
+# streamed out of win98ru/BASE4.CAB into a scratch dir under /tmp/opencode.
+# ---------------------------------------------------------------------------
+
+import argparse
+import configparser
+import hashlib
+import io
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+import pycdlib
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SYSPREP = os.path.dirname(HERE)                 # .../sysprep
+REPO = os.path.dirname(SYSPREP)                 # .../win98-quickinstall
+WORKSPACE = os.path.dirname(REPO)               # .../win98-qi-cyrillic
+REGISTRY = os.path.join(SYSPREP, 'registry')
+RECIPE = os.path.join(HERE, 'recipe.ini')
+
+DONOR_ISO = 'win98se_2222.ru.iso'
+DONOR_CAB = os.path.join('win98ru', 'BASE4.CAB')
+
+MERCYPAK_V1 = b'ZIEG'
+MERCYPAK_V2 = b'MRCY'
+MAX_FILES_PER_KNOWN_DATA = 8   # mercypak.py; install.c asserts <= 16
+
+# The four files we replace inside each ISO.  (iso_path, joliet_path, basename)
+TARGETS = [
+    ('/OSROOTS/1/FULL.866',      '/osroots/1/FULL.866',      'FULL.866'),
+    ('/OSROOTS/1/SLOWPNP.866',   '/osroots/1/SLOWPNP.866',   'SLOWPNP.866'),
+    ('/OSROOTS/1/FASTPNP.866',   '/osroots/1/FASTPNP.866',   'FASTPNP.866'),
+    ('/OSROOTS/1/WIN98QI.INF',   '/osroots/1/win98qi.inf',   'win98qi.inf'),
+]
+FULL_NAME, SLOW_NAME, FAST_NAME, INF_NAME = [t[2] for t in TARGETS]
+
+TOOLS = ['git', 'cabextract', '7z', 'python3', 'wine', 'winepath', 'unzip']
+REG_NLS_KEY = r'HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Nls'
+
+
+# ---------------------------------------------------------------------------
+# Recipe / small helpers
+# ---------------------------------------------------------------------------
+
+def load_recipe():
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.optionxform = str
+    if not cp.read(RECIPE):
+        raise SystemExit(f'Cannot read recipe: {RECIPE}')
+    return cp
+
+
+def recipe_lines(cp, section, option):
+    """Return a multi-line recipe value as a list of stripped, non-empty lines."""
+    raw = cp.get(section, option)
+    return [ln.strip() for ln in raw.strip().split('\n') if ln.strip()]
+
+
+def parse_maps(cp, section):
+    """Parse a 'DEST = source | size' section into an ordered list."""
+    out = []
+    for dest in cp.options(section):
+        val = cp.get(section, dest)
+        parts = [p.strip() for p in val.split('|')]
+        if len(parts) != 2:
+            raise ValueError(f'{section}: bad value for {dest}: {val!r}')
+        out.append((dest, parts[0], int(parts[1])))
+    return out
+
+
+def norm(path):
+    return path.replace('\\', '/').lower()
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def resolve(path):
+    """Resolve --iso/--out relative to CWD, then to WORKSPACE."""
+    if os.path.isabs(path):
+        return path
+    if os.path.exists(path):
+        return os.path.abspath(path)
+    alt = os.path.join(WORKSPACE, path)
+    if os.path.exists(alt):
+        return alt
+    return os.path.abspath(path)   # for --out: write relative to CWD
+
+
+def die(msg):
+    raise SystemExit('ERROR: ' + msg)
+
+
+def check(cond, msg):
+    if not cond:
+        die(msg)
+    print('  ok: ' + msg)
+
+
+# ---------------------------------------------------------------------------
+# MercyPak V1 / V2 reader + writer
+# ---------------------------------------------------------------------------
+
+class MercyPak:
+    def __init__(self, magic, dirs, files):
+        self.magic = magic
+        self.dirs = dirs      # list of (attr:int, name:str)  -- name uses '\'
+        self.files = files    # list of dict: path, attr, date, time, data
+
+    @property
+    def version(self):
+        return 2 if self.magic == MERCYPAK_V2 else 1
+
+
+def read_mercypak(data):
+    magic = data[:4]
+    if magic not in (MERCYPAK_V1, MERCYPAK_V2):
+        raise ValueError(f'Not a MercyPak file: {magic!r}')
+    v2 = (magic == MERCYPAK_V2)
+    dir_count, file_count = struct.unpack_from('<II', data, 4)
+    pos = 12
+    dirs = []
+    for _ in range(dir_count):
+        attr = data[pos]; pos += 1
+        ln = data[pos]; pos += 1
+        name = data[pos:pos + ln].decode('cp1252'); pos += ln
+        dirs.append((attr, name))
+
+    files = []
+    if v2:
+        total = 0
+        while total < file_count:
+            cnt = data[pos]; pos += 1
+            infos = []
+            for _ in range(cnt):
+                ln = data[pos]; pos += 1
+                name = data[pos:pos + ln].decode('cp1252'); pos += ln
+                attr = data[pos]; pos += 1
+                date, time = struct.unpack_from('<HH', data, pos); pos += 4
+                infos.append((name, attr, date, time))
+            size, = struct.unpack_from('<I', data, pos); pos += 4
+            blob = data[pos:pos + size]; pos += size
+            for name, attr, date, time in infos:
+                files.append({'path': name, 'attr': attr, 'date': date,
+                              'time': time, 'data': blob})
+            total += cnt
+        if total != file_count:
+            raise ValueError(f'V2 fileCount mismatch: {total} != {file_count}')
+    else:
+        for _ in range(file_count):
+            ln = data[pos]; pos += 1
+            name = data[pos:pos + ln].decode('cp1252'); pos += ln
+            attr = data[pos]; pos += 1
+            date, time = struct.unpack_from('<HH', data, pos); pos += 4
+            size, = struct.unpack_from('<I', data, pos); pos += 4
+            blob = data[pos:pos + size]; pos += size
+            files.append({'path': name, 'attr': attr, 'date': date,
+                          'time': time, 'data': blob})
+
+    if pos != len(data):
+        raise ValueError(f'Trailing bytes after MercyPak stream: {pos} != {len(data)}')
+    return MercyPak(magic, dirs, files)
+
+
+def _pack_name(name):
+    b = name.encode('cp1252')
+    if len(b) > 0xff:
+        raise ValueError(f'MercyPak path too long: {name!r}')
+    return struct.pack('B', len(b)) + b
+
+
+def write_mercypak(mp):
+    out = bytearray()
+    out += mp.magic
+    out += struct.pack('<II', len(mp.dirs), len(mp.files))
+    for attr, name in mp.dirs:
+        out += struct.pack('B', attr & 0xff)
+        out += _pack_name(name)
+
+    if mp.version == 1:
+        for f in mp.files:
+            out += _pack_name(f['path'])
+            out += struct.pack('B', f['attr'] & 0xff)
+            out += struct.pack('<HH', f['date'], f['time'])
+            out += struct.pack('<I', len(f['data']))
+            out += f['data']
+    else:
+        # Re-generate dedup groups by hashing, capped at MAX_FILES_PER_KNOWN_DATA,
+        # mirroring upstream mercypak.py:add_to_known_files().
+        groups = []                 # list of [data, [entries]]
+        by_hash = {}                # digest -> list of groups
+        for f in mp.files:
+            h = hashlib.sha256(f['data']).digest()
+            placed = False
+            for g in by_hash.get(h, ()):
+                if len(g[1]) < MAX_FILES_PER_KNOWN_DATA:
+                    g[1].append(f)
+                    placed = True
+                    break
+            if not placed:
+                g = [f['data'], [f]]
+                groups.append(g)
+                by_hash.setdefault(h, []).append(g)
+        for data, members in groups:
+            out += struct.pack('B', len(members))
+            for f in members:
+                out += _pack_name(f['path'])
+                out += struct.pack('B', f['attr'] & 0xff)
+                out += struct.pack('<HH', f['date'], f['time'])
+            out += struct.pack('<I', len(data))
+            out += data
+    return bytes(out)
+
+
+def index_files(mp):
+    idx = {}
+    for f in mp.files:
+        idx.setdefault(norm(f['path']), []).append(f)
+    return idx
+
+
+# ---------------------------------------------------------------------------
+# Environment / toolchain / pinned hashes
+# ---------------------------------------------------------------------------
+
+def setup_wine_env():
+    base = '/tmp/opencode' if os.path.isdir('/tmp/opencode') else tempfile.gettempdir()
+    # Stable prefix: shared across the separate cyrillize.py processes in a
+    # build so wine only initialises it once.
+    os.environ.setdefault('WINEPREFIX', os.path.join(base, 'cyrillize-wineprefix'))
+    os.environ.setdefault('WINEDEBUG', '-all')
+
+
+def check_tools():
+    for t in TOOLS:
+        if shutil.which(t) is None:
+            die(f'Missing required tool on PATH: {t}')
+    for f in ('msdos.exe', 'regedit.exe'):
+        if not os.path.isfile(os.path.join(REGISTRY, f)):
+            die(f'Missing registry tool: {os.path.join(REGISTRY, f)}')
+    print('  ok: toolchain present (' + ', '.join(TOOLS) + ')')
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_pinned_hashes(cp, iso_path):
+    print('Checking pinned hashes (PLAN.md section 2):')
+    for name, expected in cp.items('hashes'):
+        path = iso_path if os.path.basename(iso_path) == name else os.path.join(WORKSPACE, name)
+        check(os.path.isfile(path), f'{name} present')
+        got = sha256_file(path)
+        check(got == expected, f'{name} sha256 matches')
+
+
+# ---------------------------------------------------------------------------
+# Donor extraction from win98ru/BASE4.CAB
+# ---------------------------------------------------------------------------
+
+def extract_donors(cp, workdir):
+    cab = os.path.join(WORKSPACE, DONOR_CAB)
+    print('Extracting donor payloads from ' + DONOR_CAB)
+    donors = {}
+    all_items = parse_maps(cp, 'fonts') + parse_maps(cp, 'adds')
+    for _dest, src, size in all_items:
+        if src in donors:
+            continue
+        raw = subprocess.run(['cabextract', '-p', '-F', src, cab],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             check=True).stdout
+        check(len(raw) == size, f'donor {src} size {size}')
+        donors[src] = raw
+    return donors
+
+
+# ---------------------------------------------------------------------------
+# ISO reading (pycdlib)
+# ---------------------------------------------------------------------------
+
+def open_iso(path):
+    iso = pycdlib.PyCdlib()
+    iso.open(path)
+    return iso
+
+
+def read_iso_file(iso, joliet_path, workdir, tag):
+    tmp = os.path.join(workdir, '_read_' + tag)
+    iso.get_file_from_iso(tmp, joliet_path=joliet_path)
+    with open(tmp, 'rb') as fh:
+        data = fh.read()
+    os.remove(tmp)
+    return data
+
+
+def read_all_targets(iso, workdir):
+    out = {}
+    for iso_path, joliet_path, base in TARGETS:
+        out[base] = read_iso_file(iso, joliet_path, workdir, base)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# WIN.INI / SYSTEM.INI / label patching
+# ---------------------------------------------------------------------------
+
+def patch_win_ini(data, cyrsubs_lines):
+    lines = data.split(b'\r\n')
+    hdr = None
+    for i, ln in enumerate(lines):
+        if ln.strip().lower() == b'[fontsubstitutes]':
+            hdr = i
+            break
+    if hdr is None:
+        raise ValueError('WIN.INI has no [FontSubstitutes] section')
+    # Insert point: first blank line (or next [section]) after the header.
+    ins = len(lines)
+    for j in range(hdr + 1, len(lines)):
+        if lines[j] == b'' or lines[j].startswith(b'['):
+            ins = j
+            break
+    existing = set()
+    for j in range(hdr + 1, ins):
+        existing.add(lines[j].strip())
+    additions = []
+    for text in cyrsubs_lines:
+        b = text.encode('cp1252')
+        if b.strip() in existing or b in additions:
+            continue
+        additions.append(b)
+    lines[ins:ins] = additions
+    return b'\r\n'.join(lines)
+
+
+def patch_system_ini(data, oemansi_line):
+    new_val = oemansi_line.encode('cp1252')
+    pat = re.compile(rb'(oemansi\.bin=)[^\r\n]*', re.IGNORECASE)
+    if not pat.search(data):
+        raise ValueError('SYSTEM.INI has no oemansi.bin= line')
+    return pat.sub(lambda m: m.group(1) + new_val.split(b'=', 1)[1], data, count=1)
+
+
+def patch_label(data, suffix):
+    return data.rstrip(b'\r\n') + b' ' + suffix.encode('cp1252') + b'\n'
+
+
+# ---------------------------------------------------------------------------
+# Overlay into FULL.866
+# ---------------------------------------------------------------------------
+
+def overlay_full(mp, cp, donors):
+    idx = index_files(mp)
+    new_attr = cp.getint('meta', 'new_file_attr')
+    new_date = cp.getint('meta', 'new_file_date')
+    new_time = cp.getint('meta', 'new_file_time')
+
+    for dest, src, size in parse_maps(cp, 'fonts') + parse_maps(cp, 'adds'):
+        data = donors[src]
+        key = norm(dest)
+        if key in idx:                       # replace, keep attr/date/time
+            for f in idx[key]:
+                f['data'] = data
+        else:                                # insert
+            stored = dest.replace('/', '\\')
+            entry = {'path': stored, 'attr': new_attr, 'date': new_date,
+                     'time': new_time, 'data': data}
+            mp.files.append(entry)
+            idx[key] = [entry]
+
+    cyrsubs = recipe_lines(cp, 'win_ini', 'cyrsubs')
+    oemansi = cp.get('system_ini', 'oemansi').strip()
+    idx['windows/win.ini'][0]['data'] = patch_win_ini(
+        idx['windows/win.ini'][0]['data'], cyrsubs)
+    idx['windows/system.ini'][0]['data'] = patch_system_ini(
+        idx['windows/system.ini'][0]['data'], oemansi)
+    return mp
+
+
+# ---------------------------------------------------------------------------
+# Win9x SYSTEM.DAT patching via wine (upstream run_regedit() invocation)
+# ---------------------------------------------------------------------------
+
+def wine_path(path):
+    return subprocess.check_output(['winepath', '-w', path]).decode().strip()
+
+
+def build_reg_bytes(cp):
+    lines = recipe_lines(cp, 'reg', 'lines')
+    return b'\r\n'.join(ln.encode('cp1252') for ln in lines) + b'\r\n\r\n'
+
+
+def run_regedit_import(system_dat, reg_bytes, workdir, tag):
+    d = tempfile.mkdtemp(prefix='regimp_' + tag + '_', dir=workdir)
+    try:
+        with open(os.path.join(d, 'SYSTEM.DAT'), 'wb') as fh:
+            fh.write(system_dat)
+        with open(os.path.join(d, 'cyrillic.reg'), 'wb') as fh:
+            fh.write(reg_bytes)
+        regedit_exe = wine_path(os.path.join(REGISTRY, 'regedit.exe'))
+        reg_file = wine_path(os.path.join(d, 'cyrillic.reg'))
+        cmd = ['wine', os.path.join(REGISTRY, 'msdos.exe'), '-e', regedit_exe,
+               '/L:SYSTEM.DAT', '/R:SYSTEM.DAT', reg_file]
+        subprocess.run(cmd, cwd=d, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(d, 'SYSTEM.DAT'), 'rb') as fh:
+            return fh.read()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def run_regedit_export(system_dat, workdir, tag, keypath=REG_NLS_KEY):
+    d = tempfile.mkdtemp(prefix='regexp_' + tag + '_', dir=workdir)
+    try:
+        with open(os.path.join(d, 'SYSTEM.DAT'), 'wb') as fh:
+            fh.write(system_dat)
+        regedit_exe = wine_path(os.path.join(REGISTRY, 'regedit.exe'))
+        # '/E <file> <key>' (space separated, relative filename) is the only
+        # form the 16-bit regedit accepts under msdos.exe. keypath has no spaces.
+        cmd = ['wine', os.path.join(REGISTRY, 'msdos.exe'), '-e', regedit_exe,
+               '/L:SYSTEM.DAT', '/R:SYSTEM.DAT', '/E', 'EXPORT.REG', keypath]
+        subprocess.run(cmd, cwd=d, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(d, 'EXPORT.REG'), 'rb') as fh:
+            return fh.read().decode('cp1252', errors='replace')
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def parse_reg(text):
+    """Return {section: {value_name: raw_value}} for a REGEDIT4 export."""
+    sections = {}
+    cur = None
+    for line in text.splitlines():
+        line = line.rstrip('\r')
+        s = line.strip()
+        if s.startswith('[') and s.endswith(']'):
+            cur = s[1:-1]
+            sections[cur] = {}
+        elif cur is not None and '=' in line and s.startswith(('"', '@')):
+            k, v = line.split('=', 1)
+            sections[cur][k.strip()] = v.strip()
+    return sections
+
+
+def patch_registry_payload(mp, reg_bytes, workdir, tag):
+    check(mp.version == 1, f'{tag}: still MercyPak V1')
+    check(len(mp.files) == 1, f'{tag}: exactly one entry')
+    f = mp.files[0]
+    check(norm(f['path']) == 'windows/system.dat',
+          f'{tag}: single entry is WINDOWS/SYSTEM.DAT')
+    before = f['data']
+    f['data'] = run_regedit_import(before, reg_bytes, workdir, tag)
+    check(f['data'] != before, f'{tag}: SYSTEM.DAT patched by regedit')
+    return mp
+
+
+# ---------------------------------------------------------------------------
+# ISO rebuild
+# ---------------------------------------------------------------------------
+
+def rebuild_inplace(iso, patched, out_path):
+    """pycdlib rm_file/add_fp: replaces exactly the 4 target files, every other
+    byte (El Torito, boot.cat, cdrom.img, [BOOT], all other files) is preserved."""
+    keep = []   # keep BytesIO objects alive until write()
+    for iso_path, joliet_path, base in TARGETS:
+        iso.rm_file(iso_path=iso_path)
+    for iso_path, joliet_path, base in TARGETS:
+        data = patched[base]
+        fp = io.BytesIO(data)
+        keep.append(fp)
+        iso.add_fp(fp, len(data), iso_path=iso_path, joliet_path=joliet_path)
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    iso.write(out_path)
+    return keep
+
+
+def rebuild_makeiso(iso_path, out_path, patched, workdir):
+    """Literal PLAN.md step 9: full '7z x' extraction + makeiso.makeIso()."""
+    tree = os.path.join(workdir, 'tree')
+    os.makedirs(tree, exist_ok=True)
+    subprocess.run(['7z', 'x', '-y', '-o' + tree, iso_path], check=True,
+                   stdout=subprocess.DEVNULL)
+    for _iso, _jol, base in TARGETS:
+        with open(os.path.join(tree, 'osroots', '1', base), 'wb') as fh:
+            fh.write(patched[base])
+    # Avoid a duplicate BOOT.CAT: add_eltorito() creates the catalog itself.
+    bc = os.path.join(tree, 'boot.cat')
+    if os.path.exists(bc):
+        os.remove(bc)
+    sys.path.insert(0, SYSPREP)
+    import makeiso
+    makeiso.makeIso(tree, out_path, 'cdrom.img', 'QuickInstall')
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+def make_workdir(out_path):
+    base = '/tmp/opencode' if os.path.isdir('/tmp/opencode') else tempfile.gettempdir()
+    stem = os.path.splitext(os.path.basename(out_path))[0]
+    d = os.path.join(base, 'cyrillize-' + stem)
+    if os.path.exists(d):
+        shutil.rmtree(d)
+    os.makedirs(d)
+    return d
+
+
+def smoke_test(cp, iso_path, workdir):
+    """PLAN.md section 6 step 0: prove wine/msdos.exe/regedit.exe can import
+    into a real Win9x SYSTEM.DAT before anything else runs."""
+    print('Smoke-testing the fragile wine/regedit dependency:')
+    check_tools()
+    setup_wine_env()
+    iso = open_iso(iso_path)
+    slow = read_mercypak(read_iso_file(iso, '/osroots/1/SLOWPNP.866', workdir, 'slow'))
+    iso.close()
+    sysdat = slow.files[0]['data']
+    trivial = (b'REGEDIT4\r\n'
+               b'[HKEY_LOCAL_MACHINE\\Software\\CyrillizeSmokeTest]\r\n'
+               b'"Ping"="1"\r\n\r\n')
+    patched = run_regedit_import(sysdat, trivial, workdir, 'smoke')
+    check(patched != sysdat, 'regedit import modified a scratch SYSTEM.DAT')
+    print('Smoke test PASSED -- wine toolchain is usable.\n')
+
+
+def build(cp, args):
+    iso_path = resolve(args.iso)
+    out_path = resolve(args.out)
+    check(os.path.isfile(iso_path), f'input ISO exists: {iso_path}')
+    check(iso_path != out_path, 'input and output paths differ')
+    check_tools()
+    setup_wine_env()
+    check_pinned_hashes(cp, iso_path)
+
+    workdir = make_workdir(out_path)
+    try:
+        # Step 0 smoke test on a scratch SYSTEM.DAT extracted from this ISO.
+        donors = extract_donors(cp, workdir)
+
+        iso = open_iso(iso_path)
+        raw = read_all_targets(iso, workdir)
+
+        # Parse payloads.
+        full = read_mercypak(raw[FULL_NAME])
+        slow = read_mercypak(raw[SLOW_NAME])
+        fast = read_mercypak(raw[FAST_NAME])
+        check(full.version == 2, 'FULL.866 is MercyPak V2 (MRCY)')
+        check(len(full.files) == struct.unpack_from('<I', raw[FULL_NAME], 8)[0],
+              'FULL.866 fileCount matches parsed entries')
+
+        # Build the reg file once, used for both registry payloads.
+        reg_bytes = build_reg_bytes(cp)
+        smoke_sysdat = slow.files[0]['data']
+        check(run_regedit_import(smoke_sysdat, reg_bytes, workdir, 'smoke') != smoke_sysdat,
+              'wine/regedit smoke test on SYSTEM.DAT')
+
+        # Overlay FULL.866 and patch WIN.INI / SYSTEM.INI (insert-or-replace).
+        overlay_full(full, cp, donors)
+        patched = {
+            FULL_NAME: write_mercypak(full),
+        }
+
+        # Patch both registry payloads separately.
+        patch_registry_payload(slow, reg_bytes, workdir, 'slowpnp')
+        patch_registry_payload(fast, reg_bytes, workdir, 'fastpnp')
+        patched[SLOW_NAME] = write_mercypak(slow)
+        patched[FAST_NAME] = write_mercypak(fast)
+
+        # Label.
+        patched[INF_NAME] = patch_label(raw[INF_NAME],
+                                        cp.get('meta', 'label_suffix').strip())
+
+        # Rebuild.
+        print(f'Rebuilding ISO ({args.rebuild}) -> {out_path}')
+        if args.rebuild == 'makeiso':
+            rebuild_makeiso(iso_path, out_path, patched, workdir)
+        else:
+            rebuild_inplace(iso, patched, out_path)
+        iso.close()
+        print(f'Wrote {out_path} ({os.path.getsize(out_path)} bytes)\n')
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Verify (PLAN.md section 8)
+# ---------------------------------------------------------------------------
+
+def derive_input_iso(out_path):
+    """stock_cyr.iso -> stock.iso ; look for it next to the output / WORKSPACE."""
+    base = os.path.basename(out_path)
+    cand = base.replace('_cyr.iso', '.iso')
+    if cand == base:
+        return None
+    for p in (os.path.join(os.path.dirname(out_path), cand),
+              os.path.join(WORKSPACE, cand)):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def verify(cp, args):
+    out_path = resolve(args.iso)
+    check(os.path.isfile(out_path), f'output ISO exists: {out_path}')
+    setup_wine_env()
+    workdir = make_workdir(out_path + '.verify')
+    try:
+        # --- ISO level checks ---
+        print('ISO / boot structure:')
+        fileout = subprocess.check_output(['file', out_path]).decode(errors='replace')
+        check('ISO 9660' in fileout, "'file' reports ISO 9660")
+        check('bootable' in fileout.lower(), "'file' reports bootable")
+        listing = subprocess.check_output(['7z', 'l', out_path]).decode(errors='replace')
+        check('boot.cat' in listing, 'boot.cat present')
+        check('cdrom.img' in listing, 'cdrom.img present')
+        check('Boot-2.88M.img' in listing, '[BOOT]/Boot-2.88M.img present (El Torito)')
+        iso = open_iso(out_path)
+        check(iso.eltorito_boot_catalog is not None, 'pycdlib sees El Torito boot catalog')
+
+        raw = read_all_targets(iso, workdir)
+        iso.close()
+
+        # --- FULL.866 ---
+        print('FULL.866 payload:')
+        full = read_mercypak(raw[FULL_NAME])
+        check(full.magic == MERCYPAK_V2, 'FULL.866 magic is MRCY')
+        fc = struct.unpack_from('<I', raw[FULL_NAME], 8)[0]
+        check(len(full.files) == fc, 'FULL.866 fileCount equals parsed entries')
+        idx = index_files(full)
+
+        fonts = parse_maps(cp, 'fonts')
+        adds = parse_maps(cp, 'adds')
+        marker_w = cp.get('meta', 'win_ini_marker').encode('cp1252')
+        marker_s = cp.get('meta', 'system_ini_marker').encode('cp1252')
+
+        # 15 Cyrillic fonts have the recipe sizes; symbols unchanged (vs input).
+        for dest, src, size in fonts:
+            ents = idx.get(norm(dest), [])
+            check(bool(ents) and all(len(e['data']) == size for e in ents),
+                  f'font present with size {size}: {os.path.basename(dest)}')
+
+        # The 4/5 added files present with expected sizes.
+        for dest, src, size in adds:
+            ents = idx.get(norm(dest), [])
+            check(bool(ents) and all(len(e['data']) == size for e in ents),
+                  f'added file {os.path.basename(dest)} size {size}')
+
+        # UNICODE.BIN unchanged.
+        ub = idx.get('windows/system/unicode.bin')
+        check(bool(ub) and sha256(ub[0]['data']) == cp.get('meta', 'unicode_bin_sha256'),
+              'UNICODE.BIN sha256 still fa7d22bb...')
+
+        # INI markers.
+        check(marker_w in idx['windows/win.ini'][0]['data'],
+              'WIN.INI contains "MS Sans Serif,0=MS Sans Serif,204"')
+        check(marker_s in idx['windows/system.ini'][0]['data'],
+              'SYSTEM.INI contains "oemansi.bin=xlat866.bin"')
+
+        # Attribute regression check. The 15 replaced font destinations must
+        # keep their hidden/system bit (0x02); that is the loss the dedicated
+        # reader/writer prevents. 98Lite additionally ships 7 WST_*.FON at
+        # 0x20 -- those are legitimate and are verified unchanged (attr/date/
+        # time) by the input-vs-output diff below. MSDOS.SYS stays 0x07.
+        msdos = idx.get('msdos.sys')
+        check(bool(msdos) and msdos[0]['attr'] == 0x07, 'MSDOS.SYS DOS attr still 0x07')
+        font_dests = {norm(d) for d, _s, _z in fonts}
+        replaced_attrs = [e['attr'] for k in font_dests for e in idx.get(k, [])]
+        check(len(replaced_attrs) >= 15 and all(a == 0x02 for a in replaced_attrs),
+              'all 15 Cyrillic font destinations still DOS attr 0x02')
+
+        # USER.DAT: HKCU Locale still 00000409 (untouched).
+        print('USER.DAT / English UI:')
+        ud = idx.get('windows/user.dat')
+        check(bool(ud) and b'\x06\x00\x08\x00Locale00000409' in ud[0]['data'],
+              'HKCU Control Panel\\International Locale still 00000409')
+
+        # --- registry payloads ---
+        print('SLOWPNP.866 / FASTPNP.866 registries:')
+        for name in (SLOW_NAME, FAST_NAME):
+            mp = read_mercypak(raw[name])
+            check(mp.magic == MERCYPAK_V1, f'{name} is MercyPak V1 (ZIEG)')
+            check(len(mp.files) == 1 and norm(mp.files[0]['path']) == 'windows/system.dat',
+                  f'{name}: one WINDOWS/SYSTEM.DAT entry')
+            text = run_regedit_export(mp.files[0]['data'], workdir, name.lower())
+            sec = parse_reg(text)
+            cp_sec = sec.get(REG_NLS_KEY + r'\Codepage', {})
+            lo_sec = sec.get(REG_NLS_KEY + r'\Locale', {})
+            check(cp_sec.get('"ACP"') == '"1251"', f'{name}: ACP=1251')
+            check(cp_sec.get('"OEMCP"') == '"866"', f'{name}: OEMCP=866')
+            check(lo_sec.get('@') == '"00000419"', f'{name}: Locale default=00000419')
+            check(lo_sec.get('"SystemLocale"') == '"00000419"',
+                  f'{name}: SystemLocale=00000419')
+
+        # --- file-list / data diff against the input ISO (if available) ---
+        inp = derive_input_iso(out_path)
+        if inp and os.path.isfile(inp):
+            print('Diff against input ISO (only intended entries may change):')
+            iiso = open_iso(inp)
+            iraw = read_iso_file(iiso, '/osroots/1/FULL.866', workdir, 'in_full')
+            iiso.close()
+            ifull = read_mercypak(iraw)
+            iidx = index_files(ifull)
+            changed = {norm(d) for d, _s, _z in fonts}
+            changed |= {'windows/win.ini', 'windows/system.ini'}
+            added_expected = {norm(d) for d, _s, _z in adds if norm(d) not in iidx}
+
+            out_paths = set(idx.keys())
+            in_paths = set(iidx.keys())
+            check(in_paths - out_paths == set(), 'no files removed from FULL.866')
+            check(out_paths - in_paths == added_expected,
+                  'diff of file lists shows only the intended added entries')
+
+            # Every unchanged file keeps identical data + DOS metadata.
+            problems = []
+            for key in sorted(in_paths & out_paths):
+                a = iidx[key][0]
+                b = idx[key][0]
+                if (a['attr'], a['date'], a['time']) != (b['attr'], b['date'], b['time']):
+                    problems.append(key + ' (metadata)')
+                if key not in changed and a['data'] != b['data']:
+                    problems.append(key + ' (data)')
+            check(not problems, 'all unchanged entries keep data + attr/date/time'
+                  + ('' if not problems else ' -> ' + ', '.join(problems[:5])))
+
+            # Changed entries match the donor exactly.
+            donors = extract_donors(cp, workdir)
+            for dest, src, size in fonts + adds:
+                for e in idx.get(norm(dest), []):
+                    check(e['data'] == donors[src], f'{os.path.basename(dest)} == donor {src}')
+            check(b'\x06\x00\x08\x00Locale00000409' in
+                  iidx['windows/user.dat'][0]['data'],
+                  'USER.DAT byte-identical to input (HKCU Locale preserved)')
+            # symbol fonts unchanged
+            for sym in ('windows/fonts/symbole.fon', 'windows/fonts/symbolf.fon'):
+                check(iidx[sym][0]['data'] == idx[sym][0]['data'],
+                      f'{sym} unchanged (hash matches input)')
+        else:
+            print('  note: input ISO not found next to output; skipped full data diff.')
+
+        print('\nVERIFY PASSED for ' + out_path)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Bake Cyrillic support into a Win98 QuickInstall ISO.')
+    ap.add_argument('--iso', help='input ISO (build) or output ISO (--verify)')
+    ap.add_argument('--out', help='output ISO path (build)')
+    ap.add_argument('--verify', action='store_true', help='validate an output ISO')
+    ap.add_argument('--smoke-test', action='store_true',
+                    help='only run the wine/regedit smoke test and exit')
+    ap.add_argument('--rebuild', choices=['inplace', 'makeiso'], default='inplace',
+                    help='ISO rebuild method (default: inplace, preserves all bytes)')
+    args = ap.parse_args()
+
+    cp = load_recipe()
+    setup_wine_env()
+
+    if args.smoke_test:
+        if not args.iso:
+            die('--smoke-test needs --iso')
+        iso_path = resolve(args.iso)
+        check(os.path.isfile(iso_path), f'input ISO exists: {iso_path}')
+        d = make_workdir('smoke')
+        try:
+            smoke_test(cp, iso_path, d)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        return
+
+    if args.verify:
+        if not args.iso:
+            die('--verify needs --iso')
+        verify(cp, args)
+        return
+
+    if not args.iso or not args.out:
+        die('build mode needs --iso and --out')
+    build(cp, args)
+
+
+if __name__ == '__main__':
+    main()

@@ -27,7 +27,7 @@ Output: <stem>_cyr.iso, written next to the input
 
 Nothing is tied to a release version: any single-variant QuickInstall ISO
 can be passed. Input paths are resolved relative to the current directory,
-then to the REPO ROOT (where BASE4.CAB and the ISOs live), then to the
+then to the REPO ROOT (where win98/ and the ISOs live), then to the
 workspace root (legacy). Outputs are written next to each input.
 
 Options (passed through to cyrillize.py):
@@ -36,8 +36,8 @@ Options (passed through to cyrillize.py):
   -h, --help            show this help
 
 Examples:
-  ./build.sh win98qi_v1.1.0_stock.iso
-  ./build.sh win98qi_v1.1.0_stock.iso win98qi_v1.1.0_micro_directx81.iso
+  ./build.sh win98qi_stock.iso
+  ./build.sh win98qi_stock.iso win98qi_micro.iso
   ./build.sh /path/to/any-quickinstall.iso
 
 For a custom output name call cyrillize.py directly:

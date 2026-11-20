@@ -32,7 +32,8 @@ bzImage.*
 drivercopy
 
 # Cyrillic fork local inputs/outputs -- these live in the REPO ROOT and must
-# never be committed (multi-GB ISOs and the donor CAB). Anchored to the root
-# and case-insensitive (BASE4.CAB, *.iso, *_cyr.iso, ...).
+# never be committed. /win98/ is the WIN98 folder extracted from the Russian
+# Win98 SE CD ISO; the root-level patterns cover the QI ISO(s) and outputs.
+/win98/
 /*.[iI][sS][oO]
 /*.[cC][aA][bB]

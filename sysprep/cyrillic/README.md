@@ -2,32 +2,48 @@
 
 ## Get started
 
-Minimal layout — put the donor CABs and the QuickInstall ISO **inside the
-repo root**, not outside it:
+Downloads:
+
+- **QuickInstall ISO** (the prebuilt Win98 SE image to convert) —
+  [oerg866/win98-quickinstall releases](https://github.com/oerg866/win98-quickinstall/releases)
+- **Russian Windows 98 SE CD image** —
+  [Win98SE RUS on archive.org](https://archive.org/details/Win98SERUS).
+  The ISO itself is **not** placed in the project: download it, extract only
+  its `WIN98` directory into the repo root as `win98/`, then you can discard
+  the ISO.
+
+Put the extracted `win98/` folder and the QuickInstall ISO **inside the repo
+root**, not outside it. `win98/BASE4.CAB` is part of a cabinet chain, so the
+whole `WIN98` folder with all its CABs is needed — not just that one file:
 
 ```
 win98-quickinstall/              # the fork (git repo) == the repo root
-├── BASE4.CAB                    # donor payload (gitignored)
-├── CATALOG3.CAB, BASE5.CAB, ... # rest of the donor CAB chain (gitignored)
-├── any-quickinstall.iso         # any single-variant QI ISO (gitignored)
-├── any-quickinstall_cyr.iso     # generated output (gitignored)
+├── win98/                       # WIN98 folder from Russian CD (gitignored)
+│   ├── BASE4.CAB
+│   └── ... (all other CABs / CD files)
+├── win98qi_stock.iso            # any single-variant QI ISO (gitignored)
+├── win98qi_stock_cyr.iso        # generated output (gitignored)
 └── sysprep/cyrillic/            # the tool
 ```
 
 ```bash
 git clone <your-fork-url> win98-quickinstall   # fork containing sysprep/cyrillic/
-cp /path/to/donor-cd/*.CAB any-quickinstall.iso win98-quickinstall/
 cd win98-quickinstall
+
+# Download the Russian CD image, then extract ONLY its win98/ directory here:
+7z x /path/to/Win98SE_RUS.iso win98 -o.
+# (or mount the ISO and copy its WIN98 folder to ./win98/)
+
+# Put the QuickInstall ISO here too, e.g. win98qi_stock.iso
 pip3 install pycdlib
-./sysprep/cyrillic/build.sh any-quickinstall.iso
-# -> any-quickinstall_cyr.iso, in the repo root
+./sysprep/cyrillic/build.sh win98qi_stock.iso
+# -> win98qi_stock_cyr.iso, in the repo root
 ```
 
-`BASE4.CAB` is part of a **cabinet chain** (its LZX folder spans the other
-donor CABs), so all `*.CAB` files from the Russian Win98 SE CD must sit next
-to it — a lone `BASE4.CAB` yields nothing. They are all gitignored. No wine,
-no submodules, no previous outputs. The input's name/version does not matter;
-root-level `*.iso` / `*.cab` are gitignored. Requires `git`, `python3`,
+A lone `BASE4.CAB` yields nothing (its LZX folder spans the other donor CABs),
+so the whole `win98/` folder is required. Everything in `win98/` and the
+root-level `*.iso` files are gitignored. No wine, no submodules, no previous
+outputs. The input's name/version does not matter. Requires `git`, `python3`,
 `cabextract`, `7z`, `file`, `unzip` and Python `pycdlib`.
 
 Everything below explains the recipe and pipeline.
@@ -41,13 +57,13 @@ recipe. Nothing in the shell / Explorer resources is changed.
 `build.sh` takes the source ISO(s) as arguments and derives the output name:
 
 ```bash
-./build.sh win98qi_v1.1.0_stock.iso                 # -> win98qi_v1.1.0_stock_cyr.iso
-./build.sh /path/to/any-quickinstall.iso            # -> any-quickinstall_cyr.iso
-./build.sh stock.iso micro.iso                      # builds both
+./build.sh win98qi_stock.iso                     # -> win98qi_stock_cyr.iso
+./build.sh /path/to/any-quickinstall.iso        # -> any-quickinstall_cyr.iso
+./build.sh stock.iso micro.iso                  # builds both
 ```
 
-**Nothing is tied to a release version.** The two `win98qi_v1.1.0_*.iso` files
-are simply the reference images used for development/validation; the tool only
+**Nothing is tied to a release version.** The `win98qi_v1.1.0_*.iso` release
+images are simply the reference images used for development/validation; the tool only
 assumes the ISO is a single-variant QuickInstall image (`osroots/1`) with the
 usual Windows 9x tree. Windows ME is skipped. There is no variant-dropping
 logic.
@@ -148,31 +164,34 @@ A plain clone is enough — **do not** use `--recurse-submodules`
 
 ### Input files (inside the repo root)
 
-`BASE4.CAB`, the rest of the donor CAB chain and the QuickInstall ISO all
-live in the **repo root** (`win98-quickinstall/`). The repo's `.gitignore`
-ignores root-level `*.iso` and `*.cab` (case-insensitively), so none of them
-are committed.
+The donor files and the QuickInstall ISO live in the **repo root**
+(`win98-quickinstall/`): the `WIN98` directory extracted from the Russian CD
+as `win98/`, plus the QI ISO. The repo's `.gitignore` ignores `/win98/` and
+root-level `*.iso` / `*.cab`, so none of them are committed.
+
+Downloads: [QuickInstall releases](https://github.com/oerg866/win98-quickinstall/releases)
+for the QI ISO; [Win98SE RUS on archive.org](https://archive.org/details/Win98SERUS)
+for the Russian CD — download that ISO and extract only its `WIN98` directory
+into the repo root as `win98/`; the ISO itself is not needed afterwards.
 
 | File (repo root) | Purpose | Actually read? |
 |---|---|---|
-| `BASE4.CAB` | donor fonts / NLS payloads (20 files) | **yes** |
-| all other donor `*.CAB` files | required: BASE4.CAB's LZX folder spans the cabinet chain | **yes** (by cabextract) |
+| `win98/BASE4.CAB` | donor fonts / NLS payloads (20 files) | **yes** |
+| all other `win98/*.CAB` | required: BASE4.CAB's LZX folder spans the cabinet chain | **yes** (by cabextract) |
 | any single-variant QuickInstall `*.iso` | the image you pass to `build.sh` | **yes** |
-| `win98se_2222.ru.iso` | donor Russian Win98 SE CD (optional) | **no** — never opened |
 
-The `win98qi_v1.1.0_*.iso` files are just the two reference images used for
-development/validation — the build has **no dependency on their names or
+`win98qi_stock.iso` is just the reference image used for
+development/validation — the build has **no dependency on its name or
 version**. Any single-variant QuickInstall ISO can be passed.
 
 **No hash checks.** Inputs are not pinned or verified by digest: any
-single-variant QuickInstall ISO (any name/version) and the donor CABs are used
+single-variant QuickInstall ISO (any name/version) and the `win98/` folder are used
 as-is. `--verify` validates the *output* ISO directly, and optionally uses the
 matching original input for its full data diff (all other checks still pass
 without it).
 
 **Not needed:**
 
-* `win98se_2222.ru.iso` — never read; optional.
 * The generated `*_cyr.iso` outputs — they are *products*, never build inputs.
   The build always starts from the source ISO you pass; delete the outputs and
   rebuild any time (they are ~1.3 GB and gitignored).
@@ -184,7 +203,7 @@ without it).
 checks still run and verification still passes (a note is printed).
 
 **Do I still need all the ISOs?** No. To build one image you need only that
-one source ISO plus the donor CAB set (all in the repo root) — and you do **not** need the
+one source ISO plus the `win98/` folder (all in the repo root) — and you do **not** need the
 `*_cyr.iso` outputs. Pass several ISOs to `build.sh` to build them all in one
 run.
 
@@ -194,8 +213,7 @@ run.
 cd win98-quickinstall                       # the repo root
 ./sysprep/cyrillic/build.sh <input.iso> [<input2.iso> ...]
 # e.g.
-./sysprep/cyrillic/build.sh win98qi_v1.1.0_stock.iso
-./sysprep/cyrillic/build.sh win98qi_v1.1.0_stock.iso win98qi_v1.1.0_micro_directx81.iso
+./sysprep/cyrillic/build.sh win98qi_stock.iso
 ./sysprep/cyrillic/build.sh /mnt/isos/my-custom-build.iso
 ```
 
@@ -377,12 +395,12 @@ accepted as-is. `--out` must differ from `--iso`.
 
 ### 2. Donor extraction
 
-The 20 donor files are streamed out of `BASE4.CAB` (repo root) with
+The 20 donor files are streamed out of `win98/BASE4.CAB` (repo root) with
 `cabextract -p -F <name>`, renamed per the tables above, and each size is
-verified. `BASE4.CAB` is part of a cabinet chain, so every `*.CAB` from the
-donor CD must sit next to it or `cabextract` returns nothing; the tool fails
-with a clear message if the chain is missing. Nothing is written into the
-repository.
+verified. `BASE4.CAB` is part of a cabinet chain, so the whole `WIN98` folder
+extracted from the Russian CD must be present as `win98/` or `cabextract`
+returns nothing; the tool fails with a clear message if the chain is missing.
+Nothing is written into the repository.
 
 ### 3. Reading the ISO
 

@@ -24,9 +24,10 @@
 #  * --verify re-parses an output ISO and asserts the checklist in README.md.
 #
 # No Microsoft binaries are written into the repository: donor payloads are
-# streamed out of BASE4.CAB (repo root) into a scratch dir under /tmp/opencode.
-# The whole pipeline is wine-free. Local inputs (BASE4.CAB + the QI ISO) live
-# in the repo root and are gitignored.
+# streamed out of win98/BASE4.CAB (repo root) into a scratch dir under
+# /tmp/opencode. The whole pipeline is wine-free. Local inputs (the win98/
+# folder from the Russian Win98 SE CD + the QI ISO) live in the repo root and
+# are gitignored.
 # ---------------------------------------------------------------------------
 
 import argparse
@@ -49,9 +50,10 @@ REPO = os.path.dirname(SYSPREP)                 # .../win98-quickinstall (repo r
 WORKSPACE = os.path.dirname(REPO)               # .../win98-qi-cyrillic (legacy location)
 RECIPE = os.path.join(HERE, 'recipe.ini')
 
-# Local inputs live in the REPO ROOT: BASE4.CAB and the QuickInstall ISO.
-# (WORKSPACE is kept only as a legacy fallback for old checkouts.)
-DONOR_CAB = 'BASE4.CAB'
+# Local inputs live in the REPO ROOT: win98/ (the WIN98 folder extracted from
+# the Russian Win98 SE CD, containing BASE4.CAB and the rest of the cabinet
+# chain) and the QuickInstall ISO. (WORKSPACE is a legacy fallback only.)
+DONOR_CAB = os.path.join('win98', 'BASE4.CAB')
 
 MERCYPAK_V1 = b'ZIEG'
 MERCYPAK_V2 = b'MRCY'
@@ -376,7 +378,7 @@ def check_tools():
 
 
 # ---------------------------------------------------------------------------
-# Donor extraction from BASE4.CAB (repo root)
+# Donor extraction from win98/BASE4.CAB (repo root)
 # ---------------------------------------------------------------------------
 
 def extract_donors(cp, workdir):
@@ -393,8 +395,8 @@ def extract_donors(cp, workdir):
                              check=True).stdout
         if not raw:
             die(f'donor {src} not found in {DONOR_CAB}: BASE4.CAB is part of a '
-                'cabinet chain -- copy ALL *.CAB files from the donor CD into '
-                'the same directory as BASE4.CAB')
+                'cabinet chain -- place the whole WIN98 folder from the Russian '
+                'Win98 SE CD in the repo root (all *.CAB must sit next to it)')
         check(len(raw) == size, f'donor {src} size {size}')
         donors[src] = raw
     return donors

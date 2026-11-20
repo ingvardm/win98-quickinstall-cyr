@@ -3,7 +3,7 @@
 # cyrillize.py -- bake Cyrillic (cp1251 / cp866) support into the Windows 98
 #                 QuickInstall ISOs at image build time (English UI preserved).
 #
-# Implements PLAN.md (v2, simplified).  One tool, one recipe.ini, two inputs:
+# Implements the design documented in README.md. One tool, one recipe.ini, two inputs:
 #   win98qi_v1.1.0_stock.iso           -> win98qi_v1.1.0_stock_cyr.iso
 #   win98qi_v1.1.0_micro_directx81.iso -> win98qi_v1.1.0_micro_directx81_cyr.iso
 #
@@ -20,8 +20,8 @@
 #    three functional values are same-length in-place ASCII edits.
 #  * The ISO is rebuilt with pycdlib in-place rm_file/add_fp: every byte of
 #    every other file (incl. El Torito boot.cat / cdrom.img / [BOOT]) is kept.
-#    --rebuild makeiso reproduces the literal PLAN.md step 9 via makeiso.py.
-#  * --verify re-parses an output ISO and asserts everything from PLAN.md sec 8.
+#    --rebuild makeiso reproduces the upstream ISO build via makeiso.py.
+#  * --verify re-parses an output ISO and asserts the checklist in README.md.
 #
 # No Microsoft binaries are written into the repository: donor payloads are
 # streamed out of win98ru/BASE4.CAB into a scratch dir under /tmp/opencode.
@@ -48,7 +48,6 @@ REPO = os.path.dirname(SYSPREP)                 # .../win98-quickinstall
 WORKSPACE = os.path.dirname(REPO)               # .../win98-qi-cyrillic
 RECIPE = os.path.join(HERE, 'recipe.ini')
 
-DONOR_ISO = 'win98se_2222.ru.iso'
 DONOR_CAB = os.path.join('win98ru', 'BASE4.CAB')
 
 MERCYPAK_V1 = b'ZIEG'
@@ -373,13 +372,29 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def check_pinned_hashes(cp, iso_path):
-    print('Checking pinned hashes (PLAN.md section 2):')
-    for name, expected in cp.items('hashes'):
+def check_pinned_hashes(cp, iso_path, keys, strict=False):
+    """Verify pinned digests for `keys` -- the inputs this run actually consumes.
+
+    By default only those entries are checked; every other pinned file is
+    ignored, so an unused donor / other input ISO neither has to exist nor can
+    block the build with a stale hash. A checked file that is missing or
+    mismatched is still a hard error (reproducibility for what we do read).
+    `--strict-hashes` restores the original behaviour: check the whole table.
+    """
+    print('Checking pinned hashes:')
+    if strict:
+        targets = list(cp.items('hashes'))
+    else:
+        targets = [(k, cp.get('hashes', k)) for k in keys
+                   if cp.has_option('hashes', k)]
+    for name, expected in targets:
         path = iso_path if os.path.basename(iso_path) == name else os.path.join(WORKSPACE, name)
         check(os.path.isfile(path), f'{name} present')
         got = sha256_file(path)
         check(got == expected, f'{name} sha256 matches')
+    for k in keys:
+        if not cp.has_option('hashes', k):
+            print(f'  note: {k} is not a pinned input; hash not checked')
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +557,7 @@ def rebuild_inplace(iso, patched, out_path):
 
 
 def rebuild_makeiso(iso_path, out_path, patched, workdir):
-    """Literal PLAN.md step 9: full '7z x' extraction + makeiso.makeIso()."""
+    """Upstream ISO build: full '7z x' extraction + makeiso.makeIso()."""
     tree = os.path.join(workdir, 'tree')
     os.makedirs(tree, exist_ok=True)
     subprocess.run(['7z', 'x', '-y', '-o' + tree, iso_path], check=True,
@@ -573,11 +588,13 @@ def make_workdir(out_path):
     return d
 
 
-def smoke_test(cp, iso_path, workdir):
-    """PLAN.md section 6 step 0, wine-free: validate the toolchain and prove
-    the pure-Python CREG editor can patch a real Win9x SYSTEM.DAT."""
+def smoke_test(cp, iso_path, workdir, strict_hashes=False):
+    """Step 0, wine-free: validate the toolchain and prove the pure-Python CREG
+    editor can patch a real Win9x SYSTEM.DAT."""
     print('Smoke-testing the toolchain and pure-Python registry editor:')
     check_tools()
+    check_pinned_hashes(cp, iso_path, [os.path.basename(iso_path)],
+                        strict=strict_hashes)
     edits = parse_creg_edits(cp)
     iso = open_iso(iso_path)
     slow = read_mercypak(read_iso_file(iso, '/osroots/1/SLOWPNP.866', workdir, 'slow'))
@@ -595,7 +612,10 @@ def build(cp, args):
     check(os.path.isfile(iso_path), f'input ISO exists: {iso_path}')
     check(iso_path != out_path, 'input and output paths differ')
     check_tools()
-    check_pinned_hashes(cp, iso_path)
+    # Only the input ISO and the donor CAB are actually consumed by a build.
+    check_pinned_hashes(cp, iso_path,
+                        [os.path.basename(iso_path), DONOR_CAB],
+                        strict=args.strict_hashes)
 
     workdir = make_workdir(out_path)
     try:
@@ -642,7 +662,7 @@ def build(cp, args):
 
 
 # ---------------------------------------------------------------------------
-# Verify (PLAN.md section 8)
+# Verify (see README.md checklist)
 # ---------------------------------------------------------------------------
 
 def derive_input_iso(out_path):
@@ -819,6 +839,9 @@ def main():
                     help='only run the toolchain/registry-editor smoke test and exit')
     ap.add_argument('--rebuild', choices=['inplace', 'makeiso'], default='inplace',
                     help='ISO rebuild method (default: inplace, preserves all bytes)')
+    ap.add_argument('--strict-hashes', action='store_true',
+                    help='verify ALL pinned hashes (default: only inputs this run '
+                         'consumes; unused donor/other ISOs are ignored)')
     args = ap.parse_args()
 
     cp = load_recipe()
@@ -830,7 +853,7 @@ def main():
         check(os.path.isfile(iso_path), f'input ISO exists: {iso_path}')
         d = make_workdir('smoke')
         try:
-            smoke_test(cp, iso_path, d)
+            smoke_test(cp, iso_path, d, strict_hashes=args.strict_hashes)
         finally:
             shutil.rmtree(d, ignore_errors=True)
         return

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # build.sh -- one-command reproduction of the two Cyrillic QuickInstall ISOs.
-# See README.md / PLAN.md.  Run from anywhere; paths are resolved relative to
+# See README.md.  Run from anywhere; paths are resolved relative to
 # the workspace root (the parent of win98-quickinstall/).
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -16,7 +16,7 @@ echo "Workspace: $WORKSPACE"
 echo "Tool:      $TOOL"
 echo
 
-# Step 0 (PLAN.md section 6): validate the toolchain and the pure-Python
+# Step 0: validate the toolchain and the pure-Python
 # CREG registry editor before anything else touches an ISO. No wine needed.
 echo "=== Step 0: toolchain / registry-editor smoke test ==="
 "$PY" "$TOOL" --smoke-test --iso win98qi_v1.1.0_stock.iso

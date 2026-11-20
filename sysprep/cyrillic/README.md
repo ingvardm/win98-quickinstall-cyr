@@ -1,5 +1,30 @@
 # Cyrillic QuickInstall fork — how it works
 
+## Get started
+
+Minimal layout — put everything in one directory:
+
+```
+my-build/
+├── win98-quickinstall/          # the fork (git repo)
+│   └── sysprep/cyrillic/        #   this tool: build.sh, cyrillize.py, recipe.ini
+├── win98ru/
+│   └── BASE4.CAB                # the only donor file you need
+└── any-quickinstall.iso         # any single-variant QuickInstall ISO
+```
+
+```bash
+git clone <your-fork-url> win98-quickinstall   # fork containing sysprep/cyrillic/
+pip3 install pycdlib
+./win98-quickinstall/sysprep/cyrillic/build.sh any-quickinstall.iso
+# -> any-quickinstall_cyr.iso, written next to the input
+```
+
+That's it: the fork, `win98ru/BASE4.CAB`, and the ISO to convert. No other ISOs,
+no wine, no submodules, no previous outputs. The input's name/version does not
+matter. Requires `git`, `python3`, `cabextract`, `7z`, `file`, `unzip` and Python
+`pycdlib`. Everything below explains the recipe and pipeline.
+
 Bake Cyrillic support (cp1251 ANSI / cp866 OEM) into **any single-variant**
 Windows 98 SE QuickInstall ISO at **image build time**, keeping the English UI.
 The fonts, NLS files, INI edits and codepage/locale registry values come
@@ -100,9 +125,12 @@ resolves them relative to the current directory, then the **workspace root**
 and are **not needed here**. No wine, no wineprefix, no DOS emulator.
 
 ```bash
-git clone https://github.com/oerg866/win98-quickinstall.git win98-quickinstall
+git clone <your-fork-url> win98-quickinstall   # fork containing sysprep/cyrillic/
 pip3 install -r win98-quickinstall/sysprep/requirements.txt   # or just: pip3 install pycdlib
 ```
+
+(Cloning bare upstream does **not** include `sysprep/cyrillic/` — either clone
+your fork or copy that directory into an upstream clone.)
 
 On PEP 668 ("externally managed") systems add `--break-system-packages`.
 A plain clone is enough — **do not** use `--recurse-submodules`
